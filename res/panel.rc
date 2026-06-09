@@ -1,0 +1,10 @@
+#include <winuser.h>
+
+#define IDI_APPICON 1
+
+// The lowest-numbered ICON resource becomes the application icon shown by
+// Explorer, the taskbar, and Alt+Tab.
+IDI_APPICON ICON "app.ico"
+
+// Embed application manifest as RT_MANIFEST resource (type 24, id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID).
+1 24 "app.manifest"

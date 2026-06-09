@@ -1,0 +1,22 @@
+# Конфиг переехал в реестр (HKCU\Software\MultiMonitorPanel). Файлов panel.ini
+# больше нет, но игнор оставлен: если положить panel.ini рядом с exe для разовой
+# миграции на новой машине (EnsureRegistryConfig его импортирует), он может
+# содержать SSH-пароли открытым текстом — в git ему не место.
+panel.ini
+build/panel.ini
+
+# Промежуточные артефакты сборки (build.bat их и так чистит)
+*.obj
+*.res
+
+# info.txt — справка, пере-генерируется при каждом старте exe (EnsureInfoFile).
+# Самовосстанавливается на любой машине, версионировать незачем.
+build/info.txt
+
+# Локальные / IDE артефакты
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
