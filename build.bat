@@ -29,6 +29,10 @@ if errorlevel 1 (
 
 if not exist "%ROOT%\build" mkdir "%ROOT%\build"
 
+rem A running panel.exe locks the output file (LNK1104). Kill it before linking;
+rem ignore the "process not found" case so a clean machine still builds fine.
+taskkill /f /im panel.exe >nul 2>&1
+
 rem Clean old artifacts.
 if exist "%ROOT%\build\*.obj" del /q "%ROOT%\build\*.obj"
 if exist "%ROOT%\build\*.res" del /q "%ROOT%\build\*.res"
@@ -61,4 +65,8 @@ if exist "%ROOT%\build\panel.res" del /q "%ROOT%\build\panel.res"
 echo.
 echo [OK] Built: %ROOT%\build\panel.exe
 echo      Config: HKCU\Software\MultiMonitorPanel (registry, seeded on first run)
+
+rem Relaunch the freshly built panel so the build-run loop is fully automatic.
+start "" "%ROOT%\build\panel.exe"
+echo      Launched.
 endlocal

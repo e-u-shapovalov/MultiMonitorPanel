@@ -2,7 +2,7 @@
 // MultiMonitorPanel
 //
 // One .exe, one process, one AppBar window per monitor. Buttons launch
-// apps via ShellExecute. Config is a plain INI file next to the .exe.
+// apps via ShellExecute. Config lives in HKCU\Software\MultiMonitorPanel.
 //
 // Build with: build.bat  (invokes vcvars64.bat + cl.exe + rc.exe)
 // =====================================================================
@@ -58,6 +58,12 @@ constexpr wchar_t kAppTitle[]     = L"MultiMonitorPanel";
 constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1C3F8A4";
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
+// Release metadata — shown in the About dialog and the editor title bar.
+constexpr wchar_t kVersion[]      = L"1.0.0";
+constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
+constexpr wchar_t kReleaseDate[]  = L"2026-06-09";
+constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
+
 constexpr UINT WM_APPBAR_CB       = WM_APP + 1;
 constexpr UINT WM_MMP_REBUILD     = WM_APP + 10;
 constexpr UINT WM_MMP_RELOAD      = WM_APP + 11;
@@ -69,6 +75,8 @@ constexpr int  MENU_EXIT          = 2003;
 constexpr int  MENU_FOLDER        = 2006;
 constexpr int  MENU_SETDEFAULT    = 2007;
 constexpr int  MENU_ERASE         = 2008;
+constexpr int  MENU_ABOUT         = 2009;   // version / author / repo dialog
+constexpr int  MENU_LANG_BASE     = 2100;   // language submenu items: BASE + index
 
 // Config-editor control IDs. OK/Cancel reuse IDOK(1)/IDCANCEL(2) so that
 // IsDialogMessage routes Enter/Esc to them automatically.
@@ -169,6 +177,10 @@ std::vector<ButtonCfg> LoadButtonsForMonitor(int idx);
 void EnsureRegistryConfig();
 void EnsureInfoFile();
 
+void EnsureLangFiles();
+void LoadLanguage(const std::wstring& code);
+std::wstring DetectLanguageCode();
+
 HICON LoadFileIcon(const std::wstring& iconFile, int px);
 HICON LoadShellIcon(const std::wstring& path, int px);
 
@@ -220,6 +232,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     g_hInst = hInst;
     EnsureRegistryConfig();
     LoadGlobalCfg();
+
+    // Localization: write the editable lang templates, then load the chosen
+    // language (registry value "language", else auto-detected on first run).
+    EnsureLangFiles();
+    LoadLanguage(DetectLanguageCode());
 
     // Auto-create the icon directory so `icon_dir = ico` works out of the box
     // on a fresh unpack, even before the user drops any PNGs inside.
@@ -681,6 +698,322 @@ std::vector<ButtonCfg> LoadButtonsForMonitor(int idx) {
     return out;
 }
 
+// ============================ localization ===========================
+// All user-facing GUI strings live in one table with built-in Russian and
+// English columns (Russian is the primary language). On startup the chosen
+// language is loaded from HKCU (value "language"); on first run it is
+// auto-detected from the system UI language. The resolved table can be
+// overridden / extended by an external lang\<code>.lang file (INI, UTF-8),
+// so anyone can drop in their own translation. ru.lang and en.lang are
+// (re)written next to the exe each start so they serve as editable templates.
+
+enum Str {
+    S_MENU_EDIT, S_MENU_RELOAD, S_MENU_SETDEFAULT, S_MENU_ERASE,
+    S_MENU_FOLDER, S_MENU_EXIT, S_MENU_ABOUT, S_MENU_LANGUAGE,
+    S_ABOUT_VERSION, S_ABOUT_RELEASED, S_ABOUT_AUTHOR, S_ABOUT_LICENSE,
+    S_DLG_SETDEF_TITLE, S_DLG_SETDEF_BODY, S_DLG_SETDEF_OK,
+    S_DLG_ERASE_TITLE, S_DLG_ERASE_BODY, S_DLG_ERASE_OK,
+    S_DLG_HEIGHT_TITLE, S_DLG_HEIGHT_BODY,
+    S_DLG_CLOSE_TITLE, S_DLG_CLOSE_BODY, S_DLG_CLOSE_OK,
+    S_DLG_RMMON_TITLE, S_DLG_RMMON_BODY, S_DLG_RMMON_OK,
+    S_COMMON_CANCEL, S_COMMON_OK, S_COMMON_APPLY,
+    S_ED_TITLE_SUFFIX, S_ED_MONITOR, S_ED_HEIGHT, S_ED_ICONS,
+    S_ED_GRP_BUTTONS, S_ED_GRP_PROP, S_ED_LABEL, S_ED_TARGET, S_ED_ARGS,
+    S_ED_ICON, S_ED_EDGE, S_ED_LEFT, S_ED_CENTER, S_ED_RIGHT,
+    S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
+    S_ED_MON_FMT, S_ED_GROUP_LEFT, S_ED_GROUP_CENTER, S_ED_GROUP_RIGHT,
+    S_ED_ROW_UNNAMED, S_ED_FIELD_SEP,
+    S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
+    S_TIP_MONADD, S_TIP_MONDEL,
+    S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
+    S_COUNT
+};
+
+struct StrDef { const wchar_t* key; const wchar_t* ru; const wchar_t* en; };
+
+const StrDef kStrings[] = {
+    { L"menu.edit",        L"Изменить настройки…",      L"Edit config…" },
+    { L"menu.reload",      L"Перезагрузить настройки",  L"Reload config" },
+    { L"menu.setdefault",  L"Образцовый набор",         L"Set default config" },
+    { L"menu.erase",       L"Стереть настройки",        L"Erase config" },
+    { L"menu.folder",      L"Открыть папку программы (ico)", L"Open app folder (ico)" },
+    { L"menu.exit",        L"Выход",                    L"Exit" },
+    { L"menu.about",       L"О программе",              L"About" },
+    { L"menu.language",    L"Язык / Language",          L"Язык / Language" },
+    { L"about.version",    L"Версия",                   L"Version" },
+    { L"about.released",   L"Дата релиза",              L"Released" },
+    { L"about.author",     L"Автор",                    L"Author" },
+    { L"about.license",    L"Лицензия MIT",             L"MIT License" },
+    { L"dlg.setdef.title", L"Заменить кнопки образцовым набором?",
+                           L"Replace buttons with the sample set?" },
+    { L"dlg.setdef.body",
+      L"На всех мониторах кнопки заменятся стандартным набором — Проводник, "
+      L"Калькулятор, CMD и другие. Заодно это наглядный пример всех возможностей: "
+      L"блоки слева, по центру и справа, разделители, запуск от имени "
+      L"администратора, своя иконка и аргументы.",
+      L"Buttons on every monitor will be replaced with a standard set — Explorer, "
+      L"Calculator, CMD and others. It also showcases every feature: left, center "
+      L"and right blocks, separators, run-as-administrator, a custom icon and "
+      L"arguments." },
+    { L"dlg.setdef.ok",    L"Заменить",                 L"Replace" },
+    { L"dlg.erase.title",  L"Убрать все кнопки?",       L"Remove all buttons?" },
+    { L"dlg.erase.body",
+      L"Кнопки исчезнут со всех мониторов, и панели станут пустыми.\n\n"
+      L"Стандартный набор всегда возвращается через меню → «Образцовый набор».",
+      L"Buttons will disappear from every monitor and the panels will be empty.\n\n"
+      L"The standard set can always be restored from the menu → “Set default config”." },
+    { L"dlg.erase.ok",     L"Убрать",                   L"Remove" },
+    { L"dlg.height.title", L"Высота вне диапазона",     L"Height out of range" },
+    { L"dlg.height.body",  L"Высота панели должна быть числом от 24 до 200 (точек DIP).",
+                           L"The panel height must be a number from 24 to 200 (DIP units)." },
+    { L"dlg.close.title",  L"Закрыть без сохранения?",  L"Close without saving?" },
+    { L"dlg.close.body",   L"Внесённые изменения не будут записаны в настройки.",
+                           L"Your changes will not be written to the settings." },
+    { L"dlg.close.ok",     L"Закрыть",                  L"Close" },
+    { L"dlg.rmmon.title",  L"Убрать последний монитор?", L"Remove the last monitor?" },
+    { L"dlg.rmmon.body",   L"У последнего монитора есть кнопки — они удалятся вместе с ним.",
+                           L"The last monitor has buttons — they will be deleted with it." },
+    { L"dlg.rmmon.ok",     L"Убрать",                   L"Remove" },
+    { L"common.cancel",    L"Отмена",                   L"Cancel" },
+    { L"common.ok",        L"OK",                       L"OK" },
+    { L"common.apply",     L"Применить",                L"Apply" },
+    { L"ed.title.suffix",  L"настройки",                L"settings" },
+    { L"ed.monitor",       L"Монитор:",                 L"Monitor:" },
+    { L"ed.height",        L"Высота:",                  L"Height:" },
+    { L"ed.icons",         L"Иконки:",                  L"Icons:" },
+    { L"ed.grp.buttons",   L"Кнопки",                   L"Buttons" },
+    { L"ed.grp.prop",      L"Свойство кнопки",          L"Button properties" },
+    { L"ed.label",         L"Подпись:",                 L"Label:" },
+    { L"ed.target",        L"Запускать:",               L"Run:" },
+    { L"ed.args",          L"Аргументы:",               L"Arguments:" },
+    { L"ed.icon",          L"Иконка:",                  L"Icon:" },
+    { L"ed.edge",          L"Край:",                    L"Edge:" },
+    { L"ed.left",          L"слева",                    L"left" },
+    { L"ed.center",        L"центр",                    L"center" },
+    { L"ed.right",         L"справа",                   L"right" },
+    { L"ed.admin",         L"От администратора (UAC)",   L"Run as administrator (UAC)" },
+    { L"ed.console",       L"Консоль (conhost)",        L"Console (conhost)" },
+    { L"ed.sep",           L"Разделитель (вместо кнопки)", L"Separator (instead of a button)" },
+    { L"ed.add",           L"Добавить",                 L"Add" },
+    { L"ed.addsep",        L"+ Разделитель",            L"+ Separator" },
+    { L"ed.del",           L"Удалить",                  L"Delete" },
+    { L"ed.mon.fmt",       L"Монитор %d",               L"Monitor %d" },
+    { L"ed.group.left",    L"——— слева ———",            L"——— left ———" },
+    { L"ed.group.center",  L"——— центр ———",            L"——— center ———" },
+    { L"ed.group.right",   L"——— справа ———",           L"——— right ———" },
+    { L"ed.row.unnamed",   L"(без подписи)",            L"(no label)" },
+    { L"ed.field.sep",     L"(разделитель)",            L"(separator)" },
+    { L"tip.edge",
+      L"К какому краю полосы прижать кнопку: левый край, центр или правый. "
+      L"Например: папки слева, программы справа.",
+      L"Which edge of the bar to pin the button to: left, center or right. "
+      L"For example: folders on the left, programs on the right." },
+    { L"tip.addsep",       L"Добавить тонкую вертикальную черту-разделитель (не кнопку).",
+                           L"Add a thin vertical divider (not a button)." },
+    { L"tip.sep",
+      L"Сделать из этой записи вертикальную черту-разделитель вместо кнопки — "
+      L"удобно дробить кнопки на группы.",
+      L"Turn this entry into a vertical divider instead of a button — handy for "
+      L"splitting buttons into groups." },
+    { L"tip.console",
+      L"Для cmd / PowerShell и других консолей: открыть на ТОМ мониторе, где "
+      L"кнопка (через классический conhost).",
+      L"For cmd / PowerShell and other consoles: open on the SAME monitor as the "
+      L"button (via the classic conhost)." },
+    { L"tip.admin",        L"Запустить от имени администратора (будет запрос UAC).",
+                           L"Run as administrator (a UAC prompt will appear)." },
+    { L"tip.monadd",       L"Добавить монитор (для экрана, который сейчас не подключён).",
+                           L"Add a monitor (for a screen that is not connected right now)." },
+    { L"tip.mondel",       L"Убрать последний монитор.", L"Remove the last monitor." },
+    { L"filter.programs",  L"Программы (*.exe;*.lnk;*.bat;*.cmd)",
+                           L"Programs (*.exe;*.lnk;*.bat;*.cmd)" },
+    { L"filter.images",    L"Изображения (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)",
+                           L"Images (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)" },
+    { L"filter.all",       L"Все файлы (*.*)",          L"All files (*.*)" },
+};
+static_assert(_countof(kStrings) == S_COUNT, "kStrings out of sync with enum Str");
+
+std::wstring g_lang = L"ru";
+std::wstring g_str[S_COUNT];
+
+const wchar_t* T(Str id) { return g_str[id].c_str(); }
+
+std::wstring LangDir() {
+    std::wstring d = GetExeDir();
+    if (!d.empty() && d.back() != L'\\') d += L'\\';
+    return d + L"lang";
+}
+std::wstring LangFilePath(const std::wstring& code) {
+    return LangDir() + L"\\" + code + L".lang";
+}
+
+// Read a whole file and decode UTF-8 (with optional BOM) into a wide string.
+std::wstring ReadFileUtf8(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return L"";
+    DWORD size = GetFileSize(h, nullptr);
+    std::string bytes;
+    if (size && size != INVALID_FILE_SIZE) {
+        bytes.resize(size);
+        DWORD got = 0;
+        ReadFile(h, &bytes[0], size, &got, nullptr);
+        bytes.resize(got);
+    }
+    CloseHandle(h);
+    const char* p = bytes.c_str();
+    size_t n = bytes.size();
+    if (n >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+        (unsigned char)p[2] == 0xBF) { p += 3; n -= 3; }   // skip UTF-8 BOM
+    if (n == 0) return L"";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, p, static_cast<int>(n), nullptr, 0);
+    std::wstring w(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, p, static_cast<int>(n), &w[0], wlen);
+    return w;
+}
+
+// Fill the resolved table from the built-in defaults (Russian, or English when
+// the chosen language is anything other than "ru").
+void ApplyBuiltinDefaults(bool english) {
+    for (int i = 0; i < S_COUNT; ++i)
+        g_str[i] = english ? kStrings[i].en : kStrings[i].ru;
+}
+
+// Overlay key=value pairs from an external lang file onto the resolved table.
+// Reads the optional "lang.name = …" header into *outName.
+void OverlayLangFile(const std::wstring& code, std::wstring* outName) {
+    std::wstring text = ReadFileUtf8(LangFilePath(code));
+    if (text.empty()) return;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find(L'\n', pos);
+        std::wstring line = text.substr(pos, eol == std::wstring::npos ? std::wstring::npos : eol - pos);
+        pos = (eol == std::wstring::npos) ? text.size() : eol + 1;
+        line = TrimW(line);
+        if (line.empty() || line[0] == L'#' || line[0] == L';') continue;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = TrimW(line.substr(0, eq));
+        std::wstring val = TrimW(line.substr(eq + 1));
+        // Allow \n escapes in values for multi-line dialog bodies.
+        for (size_t k = 0; (k = val.find(L"\\n", k)) != std::wstring::npos; )
+            val.replace(k, 2, L"\n");
+        if (key == L"lang.name") { if (outName) *outName = val; continue; }
+        for (int i = 0; i < S_COUNT; ++i)
+            if (key == kStrings[i].key) { g_str[i] = val; break; }
+    }
+}
+
+// Read only the "lang.name = …" header from a lang file (for the menu list).
+std::wstring ReadLangName(const std::wstring& code) {
+    std::wstring text = ReadFileUtf8(LangFilePath(code));
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find(L'\n', pos);
+        std::wstring line = TrimW(text.substr(pos, eol == std::wstring::npos ? std::wstring::npos : eol - pos));
+        pos = (eol == std::wstring::npos) ? text.size() : eol + 1;
+        if (line.rfind(L"lang.name", 0) == 0) {
+            size_t eq = line.find(L'=');
+            if (eq != std::wstring::npos) return TrimW(line.substr(eq + 1));
+        }
+    }
+    return L"";
+}
+
+// Resolve the full table for a language code: built-in base + file overlay.
+void LoadLanguage(const std::wstring& code) {
+    g_lang = code.empty() ? L"ru" : code;
+    ApplyBuiltinDefaults(g_lang != L"ru");   // ru base for ru, en base for everything else
+    if (g_lang != L"ru" && g_lang != L"en")
+        OverlayLangFile(g_lang, nullptr);    // custom language: en base + file
+    else
+        OverlayLangFile(g_lang, nullptr);    // built-in: still allow user tweaks via file
+}
+
+// Persist the chosen language to the registry.
+void SaveLanguageCode(const std::wstring& code) {
+    HKEY root = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegSubkey, 0, nullptr, 0,
+                        KEY_WRITE, nullptr, &root, nullptr) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(root, L"language", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(code.c_str()),
+                   static_cast<DWORD>((code.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(root);
+}
+
+// Decide which language to use: explicit registry value wins; otherwise
+// auto-detect from the system UI language (Russian → ru, else en).
+std::wstring DetectLanguageCode() {
+    HKEY root = OpenRoot(KEY_READ);
+    std::wstring code = TrimW(RegReadStr(root, L"language"));
+    if (root) RegCloseKey(root);
+    if (!code.empty()) return code;
+    LANGID ui = GetUserDefaultUILanguage();
+    return (PRIMARYLANGID(ui) == LANG_RUSSIAN) ? L"ru" : L"en";
+}
+
+// (Re)write lang\ru.lang and lang\en.lang from the built-in defaults so users
+// have editable templates and a starting point for new translations.
+void WriteLangTemplate(const std::wstring& code, bool english) {
+    std::string out;
+    auto append = [&out](const std::wstring& w) {
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 1) return;
+        std::string s(n - 1, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n - 1, nullptr, nullptr);
+        out += s;
+    };
+    append(L"# MultiMonitorPanel language file (UTF-8). Copy to <code>.lang and\n");
+    append(L"# translate the right-hand side to add your own language.\n");
+    append(L"lang.name = " + std::wstring(english ? L"English" : L"Русский") + L"\n");
+    for (int i = 0; i < S_COUNT; ++i) {
+        std::wstring v = english ? kStrings[i].en : kStrings[i].ru;
+        // Encode embedded newlines as \n so each entry stays on one line.
+        for (size_t k = 0; (k = v.find(L'\n', k)) != std::wstring::npos; k += 2)
+            v.replace(k, 1, L"\\n");
+        append(std::wstring(kStrings[i].key) + L" = " + v + L"\n");
+    }
+    HANDLE h = CreateFileW(LangFilePath(code).c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    unsigned char bom[3] = { 0xEF, 0xBB, 0xBF };   // UTF-8 BOM
+    DWORD written = 0;
+    WriteFile(h, bom, 3, &written, nullptr);
+    WriteFile(h, out.data(), static_cast<DWORD>(out.size()), &written, nullptr);
+    CloseHandle(h);
+}
+
+void EnsureLangFiles() {
+    CreateDirectoryW(LangDir().c_str(), nullptr);
+    WriteLangTemplate(L"ru", false);
+    WriteLangTemplate(L"en", true);
+}
+
+// Enumerate available languages: built-in ru/en plus any extra lang\*.lang.
+std::vector<std::pair<std::wstring, std::wstring>> ListLanguages() {
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    out.emplace_back(L"ru", L"Русский");
+    out.emplace_back(L"en", L"English");
+    WIN32_FIND_DATAW fd{};
+    std::wstring glob = LangDir() + L"\\*.lang";
+    HANDLE h = FindFirstFileW(glob.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring name = fd.cFileName;
+            size_t dot = name.rfind(L'.');
+            if (dot == std::wstring::npos) continue;
+            std::wstring code = name.substr(0, dot);
+            if (code == L"ru" || code == L"en") continue;
+            std::wstring disp = ReadLangName(code);
+            out.emplace_back(code, disp.empty() ? code : disp);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return out;
+}
+
 // ---------------------------- info.txt --------------------------------
 // Drop a plain-language manual next to the exe on every launch, so the
 // portable build\ kit is self-explanatory. Rewritten each start to stay in
@@ -690,16 +1023,45 @@ void EnsureInfoFile() {
     if (!path.empty() && path.back() != L'\\') path += L'\\';
     path += L"info.txt";
 
-    const wchar_t* t =
+    const wchar_t* infoRu =
         L"============================================================\r\n"
-        L" MultiMonitorPanel — справка\r\n"
+        L" MultiMonitorPanel — быстрый старт\r\n"
         L"============================================================\r\n"
         L"\r\n"
         L"ЧТО ЭТО\r\n"
-        L"  Своя панель-лаунчер на КАЖДЫЙ монитор. В отличие от\r\n"
-        L"  таскбара Windows, на разных мониторах могут быть разные\r\n"
-        L"  кнопки. Это настоящая системная панель (AppBar): развёрнутые\r\n"
-        L"  окна её не перекрывают — Windows вырезает под неё полосу.\r\n"
+        L"  Portable-панель запуска для Windows 10/11: свой док на\r\n"
+        L"  КАЖДЫЙ монитор, и у каждого дока свой набор кнопок. Это\r\n"
+        L"  решение для тех, кому нужен multi monitor dock, отдельная\r\n"
+        L"  панель задач на второй монитор или быстрый запуск программ\r\n"
+        L"  на нужном экране.\r\n"
+        L"\r\n"
+        L"  Это настоящая системная панель (AppBar): развёрнутые окна\r\n"
+        L"  её не перекрывают — Windows вырезает под неё полосу. Один\r\n"
+        L"  нативный exe меньше 400 КБ, без .NET и Electron.\r\n"
+        L"\r\n"
+        L"СКАЧАЛ РЕЛИЗ — ЧТО ДЕЛАТЬ\r\n"
+        L"  1) Если скачал panel.exe, положи его в постоянную папку,\r\n"
+        L"     например C:\\Tools\\MultiMonitorPanel.\r\n"
+        L"  2) Если скачал zip-архив из Assets, сначала распакуй его.\r\n"
+        L"  3) Запусти panel.exe двойным кликом.\r\n"
+        L"  4) Не скачивай Source code и Code -> Download ZIP, если\r\n"
+        L"     тебе нужна готовая программа, а не исходники.\r\n"
+        L"  5) Для автозапуска: Win+R -> shell:startup -> положи туда\r\n"
+        L"     ярлык на panel.exe.\r\n"
+        L"\r\n"
+        L"ЗАЧЕМ СОЗДАНО\r\n"
+        L"  Windows показывает таскбар на нескольких мониторах, но не\r\n"
+        L"  даёт удобно разложить разные закреплённые приложения по\r\n"
+        L"  разным экранам. MultiMonitorPanel делает только это: папки\r\n"
+        L"  могут жить на левом мониторе, IDE на центральном, терминалы\r\n"
+        L"  и админские утилиты на правом.\r\n"
+        L"\r\n"
+        L"КАК РАБОТАЕТ\r\n"
+        L"  Программа определяет мониторы слева направо, создаёт на\r\n"
+        L"  каждом системную AppBar-панель и читает настройки из\r\n"
+        L"  HKCU\\Software\\MultiMonitorPanel. При клике кнопка запускает\r\n"
+        L"  цель через Windows Shell, а новое окно переносится на тот\r\n"
+        L"  монитор, где была нажата кнопка.\r\n"
         L"\r\n"
         L"ЗАПУСК\r\n"
         L"  - Двойной клик по panel.exe.\r\n"
@@ -710,16 +1072,19 @@ void EnsureInfoFile() {
         L"    пересоздаются.\r\n"
         L"\r\n"
         L"ПРАВАЯ КНОПКА МЫШИ ПО ПАНЕЛИ (меню):\r\n"
-        L"  Edit config...      открыть окно-редактор настроек (см. ниже)\r\n"
-        L"  Reload config       перечитать настройки и перерисовать панели\r\n"
-        L"  Set default config  записать СТАНДАРТНЫЙ образцовый набор\r\n"
-        L"                      (на 3 монитора) — в нём показаны все фишки\r\n"
-        L"  Erase config        стереть все кнопки (панели станут пустыми)\r\n"
-        L"  Open app folder     открыть папку с panel.exe (там же папка ico)\r\n"
-        L"  Exit                закрыть программу\r\n"
+        L"  Изменить настройки…   открыть окно-редактор настроек (см. ниже)\r\n"
+        L"  Перезагрузить         перечитать настройки и перерисовать панели\r\n"
+        L"  Образцовый набор      записать СТАНДАРТНЫЙ образцовый набор\r\n"
+        L"                        (на 3 монитора) — в нём показаны все фишки\r\n"
+        L"  Стереть настройки     стереть все кнопки (панели станут пустыми)\r\n"
+        L"  Язык / Language       переключить язык интерфейса\r\n"
+        L"  Открыть папку         открыть папку с panel.exe (там же папка ico)\r\n"
+        L"  О программе           версия, дата релиза, автор и ссылка на GitHub\r\n"
+        L"  Выход                 закрыть программу\r\n"
         L"\r\n"
-        L"РЕДАКТОР НАСТРОЕК (ПКМ -> Edit config...)\r\n"
-        L"  Окно правит настройки прямо на месте — без реестра и файлов.\r\n"
+        L"РЕДАКТОР НАСТРОЕК (ПКМ -> Изменить настройки…)\r\n"
+        L"  Окно правит настройки прямо на месте — без regedit и текстовых\r\n"
+        L"  файлов.\r\n"
         L"  Сверху: выбор монитора (кнопки + / − добавляют и убирают\r\n"
         L"          монитор — можно настроить экран, который сейчас не\r\n"
         L"          подключён), высота полосы, папка иконок.\r\n"
@@ -739,7 +1104,7 @@ void EnsureInfoFile() {
         L"\r\n"
         L"ГДЕ ЖИВУТ НАСТРОЙКИ\r\n"
         L"  В реестре: HKCU\\Software\\MultiMonitorPanel (не в файле).\r\n"
-        L"  Правятся через окно-редактор: ПКМ -> Edit config...\r\n"
+        L"  Правятся через окно-редактор: ПКМ -> Изменить настройки…\r\n"
         L"\r\n"
         L"КАК УСТРОЕНА КНОПКА\r\n"
         L"    label   — подпись (всплывает как подсказка)\r\n"
@@ -801,7 +1166,7 @@ void EnsureInfoFile() {
         L"  используется только monitor_1.\r\n"
         L"\r\n"
         L"ОБРАЗЕЦ\r\n"
-        L"  ПКМ -> Set default config запишет образцовый набор, где сразу\r\n"
+        L"  ПКМ -> Образцовый набор запишет образцовый набор, где сразу\r\n"
         L"  показаны все фишки: левый/центральный/правый блоки, разделители,\r\n"
         L"  запуск от админа, своя иконка, аргументы, открытие папки.\r\n"
         L"  Глянь его — и поймёшь синтаксис на примере.\r\n"
@@ -809,6 +1174,160 @@ void EnsureInfoFile() {
         L"------------------------------------------------------------\r\n"
         L" © Evgenii Shapovalov 2026\r\n"
         L"============================================================\r\n";
+
+    const wchar_t* infoEn =
+        L"============================================================\r\n"
+        L" MultiMonitorPanel — quick start\r\n"
+        L"============================================================\r\n"
+        L"\r\n"
+        L"WHAT IT IS\r\n"
+        L"  A portable launcher panel for Windows 10/11: one dock on\r\n"
+        L"  EVERY monitor, each with its own buttons. It is for people\r\n"
+        L"  who need a multi-monitor dock, a separate launcher on the\r\n"
+        L"  second screen, or quick app launch on the right monitor.\r\n"
+        L"\r\n"
+        L"  It is a real system AppBar: maximized windows do not cover\r\n"
+        L"  it because Windows reserves a strip for it. One native exe\r\n"
+        L"  under 400 KB, no .NET, no Electron.\r\n"
+        L"\r\n"
+        L"DOWNLOADED THE RELEASE — WHAT TO DO\r\n"
+        L"  1) If you downloaded panel.exe, put it into a permanent\r\n"
+        L"     folder, for example C:\\Tools\\MultiMonitorPanel.\r\n"
+        L"  2) If you downloaded a zip archive from Assets, extract it\r\n"
+        L"     first.\r\n"
+        L"  3) Double-click panel.exe.\r\n"
+        L"  4) Do not download Source code or Code -> Download ZIP if\r\n"
+        L"     you need the ready-to-run app, not the source files.\r\n"
+        L"  5) For autostart: Win+R -> shell:startup -> put a shortcut\r\n"
+        L"     to panel.exe there.\r\n"
+        L"\r\n"
+        L"WHY IT EXISTS\r\n"
+        L"  Windows can show the taskbar on several monitors, but it does\r\n"
+        L"  not let you split pinned launchers cleanly between screens.\r\n"
+        L"  MultiMonitorPanel does exactly that: folders on the left\r\n"
+        L"  monitor, IDEs in the center, terminals and admin tools on the\r\n"
+        L"  right.\r\n"
+        L"\r\n"
+        L"HOW IT WORKS\r\n"
+        L"  The program enumerates monitors from left to right, creates\r\n"
+        L"  one system AppBar panel on each screen, and reads settings\r\n"
+        L"  from HKCU\\Software\\MultiMonitorPanel. When you click a button,\r\n"
+        L"  the target is launched through Windows Shell and the new window\r\n"
+        L"  is moved to the monitor where the button was clicked.\r\n"
+        L"\r\n"
+        L"STARTING\r\n"
+        L"  - Double-click panel.exe.\r\n"
+        L"  - A second launch silently exits (only one copy runs).\r\n"
+        L"  - Autostart: put a shortcut to panel.exe into the startup\r\n"
+        L"    folder (Win+R -> shell:startup).\r\n"
+        L"  - Panels rebuild themselves when a monitor is connected or\r\n"
+        L"    disconnected.\r\n"
+        L"\r\n"
+        L"RIGHT-CLICK ON A PANEL (menu):\r\n"
+        L"  Edit config…       open the settings editor window (see below)\r\n"
+        L"  Reload config      re-read settings and redraw the panels\r\n"
+        L"  Set default config write the STANDARD sample set (for 3\r\n"
+        L"                     monitors) — it demonstrates every feature\r\n"
+        L"  Erase config       remove all buttons (panels become empty)\r\n"
+        L"  Language           switch the interface language\r\n"
+        L"  Open app folder    open the folder with panel.exe (and ico)\r\n"
+        L"  About              version, release date, author and GitHub link\r\n"
+        L"  Exit               quit the program\r\n"
+        L"\r\n"
+        L"SETTINGS EDITOR (right-click -> Edit config…)\r\n"
+        L"  The window edits settings in place — no regedit or text files.\r\n"
+        L"  Top:    monitor picker (the + / − buttons add and remove a\r\n"
+        L"          monitor — you can set up a screen that is not\r\n"
+        L"          connected right now), bar height, icon folder.\r\n"
+        L"  Left:   the selected monitor's button list, GROUPED by edge:\r\n"
+        L"          “left”, “center”, “right” sections.\r\n"
+        L"  Right:  the selected button's fields — label, what to run,\r\n"
+        L"          arguments, icon (the … button picks a file), EDGE\r\n"
+        L"          (which side of the bar to pin it to) and the\r\n"
+        L"          admin / console / separator check boxes.\r\n"
+        L"  The Add / + Separator / Delete / ▲ / ▼ buttons change the\r\n"
+        L"          set and order. ▲/▼ at a section edge move the entry\r\n"
+        L"          into the neighbouring group.\r\n"
+        L"  A separator takes its edge from where it sits — move it with\r\n"
+        L"  ▲/▼ into the right section (its edge radio is disabled).\r\n"
+        L"  OK or Apply — write and redraw the panels at once (Apply\r\n"
+        L"  keeps the window open). Cancel — leave without saving.\r\n"
+        L"\r\n"
+        L"WHERE SETTINGS LIVE\r\n"
+        L"  In the registry: HKCU\\Software\\MultiMonitorPanel (not a file).\r\n"
+        L"  Edit them through the window: right-click -> Edit config…\r\n"
+        L"\r\n"
+        L"HOW A BUTTON IS BUILT\r\n"
+        L"    label   — caption (shown as a tooltip)\r\n"
+        L"    target  — what to run\r\n"
+        L"    args    — arguments (optional)\r\n"
+        L"    icon    — a custom icon (optional)\r\n"
+        L"    flags   — extra flags (optional)\r\n"
+        L"\r\n"
+        L"  target can be:\r\n"
+        L"    - a program by name:              notepad.exe, calc.exe\r\n"
+        L"    - a full path:                    C:\\Program Files\\App\\app.exe\r\n"
+        L"    - a folder (opens in Explorer):   C:\\Users\\Name\\Downloads\r\n"
+        L"    - a Store app:                    shell:AppsFolder\\<AUMID>\r\n"
+        L"\r\n"
+        L"BUTTON FLAGS (in the editor — check boxes and the block choice)\r\n"
+        L"    admin    run as administrator (UAC prompt)\r\n"
+        L"    left     button in the LEFT block (default)\r\n"
+        L"    center   button in the CENTER block\r\n"
+        L"    right    button in the RIGHT block (pinned right)\r\n"
+        L"    sep      not a button, but a vertical separator\r\n"
+        L"    console  for cmd/powershell and other consoles: open on the\r\n"
+        L"             SAME monitor as the button (via classic conhost).\r\n"
+        L"             Without it a console may drift to another monitor —\r\n"
+        L"             its window is owned by Windows Terminal, not the cmd.\r\n"
+        L"\r\n"
+        L"BLOCKS (left / center / right)\r\n"
+        L"  The bar can be split into 2-3 blocks. For example: folders on\r\n"
+        L"  the left (no flag), programs on the right (the right flag).\r\n"
+        L"  Some icons sit at the left edge, some at the right.\r\n"
+        L"\r\n"
+        L"SEPARATORS\r\n"
+        L"  To visually split buttons into groups — insert a separator:\r\n"
+        L"  in the editor press “+ Separator” (or tick the “Separator”\r\n"
+        L"  box on a selected button). It is a thin vertical line; it also\r\n"
+        L"  obeys the edge (left/center/right).\r\n"
+        L"\r\n"
+        L"ICONS — WHERE TO PUT THEM\r\n"
+        L"  By default icons come from the \"ico\" subfolder NEXT TO\r\n"
+        L"  panel.exe. The folder is created automatically on start.\r\n"
+        L"  Wherever you move the exe, ico is always looked up next to it:\r\n"
+        L"    - panel.exe in ...\\build  ->  icons in ...\\build\\ico\r\n"
+        L"    - panel.exe in C:\\ttt     ->  icons in C:\\ttt\\ico\r\n"
+        L"  In the icon field just write a file name (foo.png) — it is\r\n"
+        L"  looked up in that folder. Or give a full path to any file.\r\n"
+        L"  Change the folder: the icon_dir value in the registry\r\n"
+        L"  (relative — next to the exe; absolute — anywhere, e.g.\r\n"
+        L"  D:\\my-icons).\r\n"
+        L"\r\n"
+        L"  Formats: .ico .png .jpg .bmp .gif .tiff  (SVG NOT supported).\r\n"
+        L"  Any size is shrunk to 32 px. A 48..256 px square PNG with\r\n"
+        L"  transparency works best.\r\n"
+        L"\r\n"
+        L"ENVIRONMENT VARIABLES\r\n"
+        L"  In target/args/icon you can use %USERNAME%, %USERPROFILE%,\r\n"
+        L"  %APPDATA% and so on — they are expanded automatically.\r\n"
+        L"\r\n"
+        L"DIFFERENT BUTTONS ON DIFFERENT MONITORS\r\n"
+        L"  monitor_1 — the leftmost monitor, monitor_2 — to its right,\r\n"
+        L"  and so on. Each has its own button set. On a single-monitor\r\n"
+        L"  machine only monitor_1 is used.\r\n"
+        L"\r\n"
+        L"SAMPLE\r\n"
+        L"  Right-click -> Set default config writes a sample set that\r\n"
+        L"  shows every feature at once: left/center/right blocks,\r\n"
+        L"  separators, run-as-admin, a custom icon, arguments, opening a\r\n"
+        L"  folder. Look at it to learn the syntax by example.\r\n"
+        L"\r\n"
+        L"------------------------------------------------------------\r\n"
+        L" © Evgenii Shapovalov 2026\r\n"
+        L"============================================================\r\n";
+
+    const wchar_t* t = (g_lang == L"ru") ? infoRu : infoEn;
 
     HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1432,6 +1951,35 @@ bool ConfirmDialog(HWND hwnd, PCWSTR mainInstr, PCWSTR content,
     return pressed == IDOK;
 }
 
+// Callback for the About dialog — open the repo link in the default browser
+// when the user clicks it (TDF_ENABLE_HYPERLINKS makes <a href> clickable).
+HRESULT CALLBACK AboutCallback(HWND, UINT msg, WPARAM, LPARAM lp, LONG_PTR) {
+    if (msg == TDN_HYPERLINK_CLICKED)
+        ShellExecuteW(nullptr, L"open", reinterpret_cast<PCWSTR>(lp), nullptr, nullptr, SW_SHOWNORMAL);
+    return S_OK;
+}
+
+void AboutDialog(HWND hwnd) {
+    std::wstring content =
+        std::wstring(T(S_ABOUT_VERSION)) + L" " + kVersion + L"\n"
+        + T(S_ABOUT_RELEASED) + L": " + kReleaseDate + L"\n"
+        + T(S_ABOUT_AUTHOR) + L": " + kAuthor + L"\n\n"
+        L"<a href=\"" + std::wstring(kRepoUrl) + L"\">" + std::wstring(kRepoUrl) + L"</a>\n\n"
+        L"© " + std::wstring(kAuthor) + L" 2026 · " + T(S_ABOUT_LICENSE);
+    TASKDIALOGCONFIG cfg{ sizeof(cfg) };
+    cfg.hwndParent         = hwnd;
+    cfg.hInstance          = g_hInst;
+    cfg.dwFlags            = TDF_ALLOW_DIALOG_CANCELLATION | TDF_ENABLE_HYPERLINKS;
+    cfg.pszWindowTitle     = kAppTitle;
+    cfg.pszMainIcon        = TD_INFORMATION_ICON;
+    cfg.pszMainInstruction = kAppTitle;
+    cfg.pszContent         = content.c_str();
+    cfg.dwCommonButtons    = TDCBF_CLOSE_BUTTON;
+    cfg.pfCallback         = AboutCallback;
+    if (FAILED(TaskDialogIndirect(&cfg, nullptr, nullptr, nullptr)))
+        MessageBoxW(hwnd, content.c_str(), kAppTitle, MB_OK);
+}
+
 // ===================== built-in config editor ========================
 // A modeless master-detail window for editing the registry config without
 // regedit or an ini round-trip. Left: the selected monitor's button list.
@@ -1496,7 +2044,16 @@ void EdEnable(HWND hwnd, int id, bool on) {
 // ---- control layout table (DIP; scaled by S() at create + WM_DPICHANGED) ----
 enum EdKind { K_STATIC, K_GROUP, K_EDIT, K_EDITNUM, K_COMBO, K_LIST,
               K_BTN, K_DEFBTN, K_RADIO1, K_RADIO, K_CHECK, K_CHECKG };
-struct EdCtl { int id; EdKind kind; const wchar_t* text; int x, y, w, h; };
+// Anchor flags — how a control reacts to the editor window being resized past
+// its base size (kEdClientW/H). dW/dH = current client minus base client.
+enum EdAnchor {
+    A_NONE     = 0,
+    A_WSTRETCH = 1,   // width  += dW  (field grows to the right)
+    A_HSTRETCH = 2,   // height += dH  (list / groupbox grows down)
+    A_MOVEX    = 4,   // x      += dW  (sticks to the right edge)
+    A_MOVEY    = 8,   // y      += dH  (sticks to the bottom edge)
+};
+struct EdCtl { int id; EdKind kind; const wchar_t* text; int x, y, w, h; int anchor; };
 
 // "Mute" ids for labels/groupboxes we never address by hand.
 constexpr int IDC_LBL_MON=3200, IDC_LBL_H=3201, IDC_LBL_ICODIR=3202,
@@ -1513,27 +2070,27 @@ const EdCtl kEd[] = {
     { IDC_LBL_H,         K_STATIC,  L"Высота:",   238,  16,  46, 18 },
     { IDC_HEIGHT_EDIT,   K_EDITNUM, L"",          286,  12,  44, 23 },
     { IDC_LBL_ICODIR,    K_STATIC,  L"Иконки:",   344,  16,  46, 18 },
-    { IDC_ICONDIR_EDIT,  K_EDIT,    L"",          392,  12, 180, 23 },
+    { IDC_ICONDIR_EDIT,  K_EDIT,    L"",          392,  12, 180, 23, A_WSTRETCH },
     // left column — button list
-    { IDC_GRP_BTN,       K_GROUP,   L"Кнопки",     12,  44, 250, 250 },
-    { IDC_BTN_LIST,      K_LIST,    L"",           24,  64, 226, 218 },
-    { IDC_BTN_ADD,       K_BTN,     L"Добавить",     12, 300, 118, 26 },
-    { IDC_BTN_ADDSEP,    K_BTN,     L"+ Разделитель",136, 300, 118, 26 },
-    { IDC_BTN_DEL,       K_BTN,     L"Удалить",      12, 332, 118, 26 },
-    { IDC_BTN_UP,        K_BTN,     L"▲",           136, 332,  56, 26 },
-    { IDC_BTN_DOWN,      K_BTN,     L"▼",           198, 332,  56, 26 },
+    { IDC_GRP_BTN,       K_GROUP,   L"Кнопки",     12,  44, 250, 250, A_HSTRETCH },
+    { IDC_BTN_LIST,      K_LIST,    L"",           24,  64, 226, 218, A_HSTRETCH },
+    { IDC_BTN_ADD,       K_BTN,     L"Добавить",     12, 300, 118, 26, A_MOVEY },
+    { IDC_BTN_ADDSEP,    K_BTN,     L"+ Разделитель",136, 300, 118, 26, A_MOVEY },
+    { IDC_BTN_DEL,       K_BTN,     L"Удалить",      12, 332, 118, 26, A_MOVEY },
+    { IDC_BTN_UP,        K_BTN,     L"▲",           136, 332,  56, 26, A_MOVEY },
+    { IDC_BTN_DOWN,      K_BTN,     L"▼",           198, 332,  56, 26, A_MOVEY },
     // right column — selected button's properties
-    { IDC_GRP_PROP,      K_GROUP,   L"Свойство кнопки", 274, 44, 298, 314 },
+    { IDC_GRP_PROP,      K_GROUP,   L"Свойство кнопки", 274, 44, 298, 314, A_WSTRETCH | A_HSTRETCH },
     { IDC_LBL_LABEL,     K_STATIC,  L"Подпись:",   286,  68,  80, 18 },
-    { IDC_LABEL_EDIT,    K_EDIT,    L"",           372,  64, 188, 23 },
+    { IDC_LABEL_EDIT,    K_EDIT,    L"",           372,  64, 188, 23, A_WSTRETCH },
     { IDC_LBL_TARGET,    K_STATIC,  L"Запускать:", 286,  98,  80, 18 },
-    { IDC_TARGET_EDIT,   K_EDIT,    L"",           372,  94, 154, 23 },
-    { IDC_TARGET_BROWSE, K_BTN,     L"...",        528,  94,  32, 23 },
+    { IDC_TARGET_EDIT,   K_EDIT,    L"",           372,  94, 154, 23, A_WSTRETCH },
+    { IDC_TARGET_BROWSE, K_BTN,     L"...",        528,  94,  32, 23, A_MOVEX },
     { IDC_LBL_ARGS,      K_STATIC,  L"Аргументы:", 286, 128,  80, 18 },
-    { IDC_ARGS_EDIT,     K_EDIT,    L"",           372, 124, 188, 23 },
+    { IDC_ARGS_EDIT,     K_EDIT,    L"",           372, 124, 188, 23, A_WSTRETCH },
     { IDC_LBL_ICON,      K_STATIC,  L"Иконка:",    286, 158,  80, 18 },
-    { IDC_ICON_EDIT,     K_EDIT,    L"",           372, 154, 154, 23 },
-    { IDC_ICON_BROWSE,   K_BTN,     L"...",        528, 154,  32, 23 },
+    { IDC_ICON_EDIT,     K_EDIT,    L"",           372, 154, 154, 23, A_WSTRETCH },
+    { IDC_ICON_BROWSE,   K_BTN,     L"...",        528, 154,  32, 23, A_MOVEX },
     { IDC_LBL_ALIGN,     K_STATIC,  L"Край:",      286, 190,  44, 18 },
     { IDC_ALIGN_L,       K_RADIO1,  L"слева",      332, 189,  70, 20 },
     { IDC_ALIGN_C,       K_RADIO,   L"центр",      404, 189,  70, 20 },
@@ -1542,9 +2099,9 @@ const EdCtl kEd[] = {
     { IDC_CHK_CONSOLE,   K_CHECK,   L"Консоль (conhost)",          332, 246, 228, 20 },
     { IDC_CHK_SEP,       K_CHECK,   L"Разделитель (вместо кнопки)",332, 272, 228, 20 },
     // bottom — actions
-    { IDOK,              K_DEFBTN,  L"OK",        322, 372,  78, 26 },
-    { IDCANCEL,          K_BTN,     L"Отмена",    408, 372,  78, 26 },
-    { IDC_APPLY,         K_BTN,     L"Применить", 494, 372,  78, 26 },
+    { IDOK,              K_DEFBTN,  L"OK",        322, 372,  78, 26, A_MOVEX | A_MOVEY },
+    { IDCANCEL,          K_BTN,     L"Отмена",    408, 372,  78, 26, A_MOVEX | A_MOVEY },
+    { IDC_APPLY,         K_BTN,     L"Применить", 494, 372,  78, 26, A_MOVEX | A_MOVEY },
 };
 constexpr int kEdClientW = 584, kEdClientH = 404;   // DIP
 
@@ -1565,11 +2122,29 @@ void EditorApplyFont(HWND hwnd, EditorState* st) {
 }
 
 void EditorLayout(HWND hwnd, EditorState* st) {
+    // dW/dH: how far the client area has been stretched past the base design.
+    RECT cr; GetClientRect(hwnd, &cr);
+    int dW = cr.right  - MulDiv(kEdClientW, st->dpi, 96);
+    int dH = cr.bottom - MulDiv(kEdClientH, st->dpi, 96);
+    if (dW < 0) dW = 0;
+    if (dH < 0) dH = 0;
+    HDWP dwp = BeginDeferWindowPos(_countof(kEd));
     for (const EdCtl& c : kEd) {
         HWND ctl = GetDlgItem(hwnd, c.id);
-        if (ctl) MoveWindow(ctl, MulDiv(c.x, st->dpi, 96), MulDiv(c.y, st->dpi, 96),
-                            MulDiv(c.w, st->dpi, 96), MulDiv(c.h, st->dpi, 96), TRUE);
+        if (!ctl) continue;
+        int x = MulDiv(c.x, st->dpi, 96), y = MulDiv(c.y, st->dpi, 96);
+        int w = MulDiv(c.w, st->dpi, 96), h = MulDiv(c.h, st->dpi, 96);
+        if (c.anchor & A_MOVEX)    x += dW;
+        if (c.anchor & A_MOVEY)    y += dH;
+        if (c.anchor & A_WSTRETCH) w += dW;
+        if (c.anchor & A_HSTRETCH) h += dH;
+        if (dwp) dwp = DeferWindowPos(dwp, ctl, nullptr, x, y, w, h,
+                                      SWP_NOZORDER | SWP_NOACTIVATE);
+        else MoveWindow(ctl, x, y, w, h, TRUE);
     }
+    if (dwp) EndDeferWindowPos(dwp);
+    // Groupbox borders span the stretched area — repaint to avoid ghost edges.
+    InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 void EditorCreateControls(HWND hwnd, EditorState* st) {
@@ -1597,6 +2172,26 @@ void EditorCreateControls(HWND hwnd, EditorState* st) {
                         g_hInst, nullptr);
     }
     EditorApplyFont(hwnd, st);
+}
+
+// Set the localized caption on every labeled control (kEd holds layout only;
+// symbol buttons +/−/▲/▼/… keep their glyphs). Called once after creation.
+void EditorApplyTexts(HWND hwnd) {
+    struct { int id; Str s; } map[] = {
+        { IDC_LBL_MON, S_ED_MONITOR }, { IDC_LBL_H, S_ED_HEIGHT },
+        { IDC_LBL_ICODIR, S_ED_ICONS }, { IDC_GRP_BTN, S_ED_GRP_BUTTONS },
+        { IDC_BTN_ADD, S_ED_ADD }, { IDC_BTN_ADDSEP, S_ED_ADDSEP },
+        { IDC_BTN_DEL, S_ED_DEL }, { IDC_GRP_PROP, S_ED_GRP_PROP },
+        { IDC_LBL_LABEL, S_ED_LABEL }, { IDC_LBL_TARGET, S_ED_TARGET },
+        { IDC_LBL_ARGS, S_ED_ARGS }, { IDC_LBL_ICON, S_ED_ICON },
+        { IDC_LBL_ALIGN, S_ED_EDGE }, { IDC_ALIGN_L, S_ED_LEFT },
+        { IDC_ALIGN_C, S_ED_CENTER }, { IDC_ALIGN_R, S_ED_RIGHT },
+        { IDC_CHK_ADMIN, S_ED_ADMIN }, { IDC_CHK_CONSOLE, S_ED_CONSOLE },
+        { IDC_CHK_SEP, S_ED_SEP }, { IDOK, S_COMMON_OK },
+        { IDCANCEL, S_COMMON_CANCEL }, { IDC_APPLY, S_COMMON_APPLY },
+    };
+    for (auto& m : map)
+        SetWindowTextW(GetDlgItem(hwnd, m.id), T(m.s));
 }
 
 // ---- model <-> registry ----
@@ -1691,7 +2286,7 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
     } else if (sep) {
         // A separator: the per-button fields don't apply — show a hint in the
         // (disabled) label and blank the rest, but leave the model untouched.
-        EdSetText(hwnd, IDC_LABEL_EDIT,  L"(разделитель)");
+        EdSetText(hwnd, IDC_LABEL_EDIT,  T(S_ED_FIELD_SEP));
         EdSetText(hwnd, IDC_TARGET_EDIT, L"");
         EdSetText(hwnd, IDC_ARGS_EDIT,   L"");
         EdSetText(hwnd, IDC_ICON_EDIT,   L"");
@@ -1742,9 +2337,7 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
 bool EditorFlushGlobal(HWND hwnd, EditorState* st) {
     int h = _wtoi(TrimW(EdGetText(hwnd, IDC_HEIGHT_EDIT)).c_str());
     if (h < MIN_HEIGHT_DIP || h > MAX_HEIGHT_DIP) {
-        InfoDialog(hwnd, L"Высота вне диапазона",
-                   L"Высота панели должна быть числом от 24 до 200 (точек DIP).",
-                   TD_WARNING_ICON);
+        InfoDialog(hwnd, T(S_DLG_HEIGHT_TITLE), T(S_DLG_HEIGHT_BODY), TD_WARNING_ICON);
         return false;
     }
     st->heightDip = h;
@@ -1756,14 +2349,14 @@ bool EditorFlushGlobal(HWND hwnd, EditorState* st) {
 // ---- list view of the current monitor's buttons ----
 std::wstring EditorRowText(const ButtonCfg& b) {
     if (b.isSeparator)   return L"——————————";
-    if (b.label.empty()) return L"(без подписи)";
+    if (b.label.empty()) return T(S_ED_ROW_UNNAMED);
     return b.label;
 }
 
 const wchar_t* EditorGroupName(BtnAlign a) {
-    return a == BtnAlign::Left   ? L"——— слева ———"
-         : a == BtnAlign::Center ? L"——— центр ———"
-                                 : L"——— справа ———";
+    return a == BtnAlign::Left   ? T(S_ED_GROUP_LEFT)
+         : a == BtnAlign::Center ? T(S_ED_GROUP_CENTER)
+                                 : T(S_ED_GROUP_RIGHT);
 }
 
 // The list shows three fixed section headers (слева / центр / справа); the
@@ -1837,8 +2430,8 @@ void EditorFillMonCombo(HWND hwnd, EditorState* st) {
     HWND cb = GetDlgItem(hwnd, IDC_MON_COMBO);
     SendMessageW(cb, CB_RESETCONTENT, 0, 0);
     for (size_t i = 0; i < st->mons.size(); ++i) {
-        wchar_t buf[32];
-        _snwprintf_s(buf, _countof(buf), _TRUNCATE, L"Монитор %d", static_cast<int>(i) + 1);
+        wchar_t buf[48];
+        _snwprintf_s(buf, _countof(buf), _TRUNCATE, T(S_ED_MON_FMT), static_cast<int>(i) + 1);
         SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(buf));
     }
     SendMessageW(cb, CB_SETCURSEL, st->curMon, 0);
@@ -1847,9 +2440,16 @@ void EditorFillMonCombo(HWND hwnd, EditorState* st) {
 // ---- file pickers for target / icon ----
 void EditorBrowseTarget(HWND hwnd) {
     wchar_t file[MAX_PATH * 2] = L"";
+    // OPENFILENAME filters are '\0'-delimited (desc, pattern, …) — build the
+    // buffer with localized descriptions and fixed patterns.
+    std::wstring filter;
+    filter += T(S_FILTER_PROGRAMS); filter.push_back(L'\0');
+    filter += L"*.exe;*.lnk;*.bat;*.cmd"; filter.push_back(L'\0');
+    filter += T(S_FILTER_ALL); filter.push_back(L'\0');
+    filter += L"*.*"; filter.push_back(L'\0');
     OPENFILENAMEW ofn{ sizeof(ofn) };
     ofn.hwndOwner   = hwnd;
-    ofn.lpstrFilter = L"Программы (*.exe;*.lnk;*.bat;*.cmd)\0*.exe;*.lnk;*.bat;*.cmd\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFilter = filter.c_str();
     ofn.lpstrFile   = file;
     ofn.nMaxFile    = _countof(file);
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
@@ -1859,10 +2459,14 @@ void EditorBrowseTarget(HWND hwnd) {
 
 void EditorBrowseIcon(HWND hwnd) {
     wchar_t file[MAX_PATH * 2] = L"";
+    std::wstring filter;
+    filter += T(S_FILTER_IMAGES); filter.push_back(L'\0');
+    filter += L"*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff"; filter.push_back(L'\0');
+    filter += T(S_FILTER_ALL); filter.push_back(L'\0');
+    filter += L"*.*"; filter.push_back(L'\0');
     OPENFILENAMEW ofn{ sizeof(ofn) };
     ofn.hwndOwner   = hwnd;
-    ofn.lpstrFilter = L"Изображения (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)\0"
-                      L"*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0Все файлы (*.*)\0*.*\0";
+    ofn.lpstrFilter = filter.c_str();
     ofn.lpstrFile   = file;
     ofn.nMaxFile    = _countof(file);
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
@@ -1898,25 +2502,17 @@ void EditorCreateTooltips(HWND hwnd) {
     SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 340);  // allow wrapped multi-line tips
     SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
 
-    const wchar_t* edgeTip =
-        L"К какому краю полосы прижать кнопку: левый край, центр или правый. "
-        L"Например: папки слева, программы справа.";
+    const wchar_t* edgeTip = T(S_TIP_EDGE);
     EditorAddTip(tip, hwnd, IDC_LBL_ALIGN, edgeTip);
     EditorAddTip(tip, hwnd, IDC_ALIGN_L,   edgeTip);
     EditorAddTip(tip, hwnd, IDC_ALIGN_C,   edgeTip);
     EditorAddTip(tip, hwnd, IDC_ALIGN_R,   edgeTip);
-    EditorAddTip(tip, hwnd, IDC_BTN_ADDSEP,
-        L"Добавить тонкую вертикальную черту-разделитель (не кнопку).");
-    EditorAddTip(tip, hwnd, IDC_CHK_SEP,
-        L"Сделать из этой записи вертикальную черту-разделитель вместо кнопки — "
-        L"удобно дробить кнопки на группы.");
-    EditorAddTip(tip, hwnd, IDC_CHK_CONSOLE,
-        L"Для cmd / PowerShell и других консолей: открыть на ТОМ мониторе, где "
-        L"кнопка (через классический conhost).");
-    EditorAddTip(tip, hwnd, IDC_CHK_ADMIN,
-        L"Запустить от имени администратора (будет запрос UAC).");
-    EditorAddTip(tip, hwnd, IDC_MON_ADD, L"Добавить монитор (для экрана, который сейчас не подключён).");
-    EditorAddTip(tip, hwnd, IDC_MON_DEL, L"Убрать последний монитор.");
+    EditorAddTip(tip, hwnd, IDC_BTN_ADDSEP,  T(S_TIP_ADDSEP));
+    EditorAddTip(tip, hwnd, IDC_CHK_SEP,     T(S_TIP_SEP));
+    EditorAddTip(tip, hwnd, IDC_CHK_CONSOLE, T(S_TIP_CONSOLE));
+    EditorAddTip(tip, hwnd, IDC_CHK_ADMIN,   T(S_TIP_ADMIN));
+    EditorAddTip(tip, hwnd, IDC_MON_ADD,     T(S_TIP_MONADD));
+    EditorAddTip(tip, hwnd, IDC_MON_DEL,     T(S_TIP_MONDEL));
 }
 
 // ---- grouping / reordering ----
@@ -1975,6 +2571,7 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             st->loading = true;                 // suppress EN_CHANGE while we fill fields
             EditorMakeFont(st);
             EditorCreateControls(hwnd, st);
+            EditorApplyTexts(hwnd);
             EditorLoadModel(st);
             st->curMon = 0;
             st->curBtn = st->mons.empty() || st->mons[0].empty() ? -1 : 0;
@@ -2105,9 +2702,8 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                     if (st->mons.size() > 1) {
                         EditorFlushFields(hwnd, st);
                         bool nonEmpty = !st->mons.back().empty();
-                        if (!nonEmpty || ConfirmDialog(hwnd, L"Убрать последний монитор?",
-                                L"У последнего монитора есть кнопки — они удалятся вместе с ним.",
-                                L"Убрать", TD_WARNING_ICON)) {
+                        if (!nonEmpty || ConfirmDialog(hwnd, T(S_DLG_RMMON_TITLE),
+                                T(S_DLG_RMMON_BODY), T(S_DLG_RMMON_OK), TD_WARNING_ICON)) {
                             st->mons.pop_back();
                             if (st->curMon >= static_cast<int>(st->mons.size()))
                                 st->curMon = static_cast<int>(st->mons.size()) - 1;
@@ -2135,9 +2731,8 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                     break;
                 case IDCANCEL:
                     if (!st->dirty ||
-                        ConfirmDialog(hwnd, L"Закрыть без сохранения?",
-                                      L"Внесённые изменения не будут записаны в настройки.",
-                                      L"Закрыть", TD_WARNING_ICON))
+                        ConfirmDialog(hwnd, T(S_DLG_CLOSE_TITLE), T(S_DLG_CLOSE_BODY),
+                                      T(S_DLG_CLOSE_OK), TD_WARNING_ICON))
                         DestroyWindow(hwnd);
                     break;
             }
@@ -2148,6 +2743,23 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             // Labels / groupboxes / checkboxes paint cleanly on the dialog face.
             SetBkMode(reinterpret_cast<HDC>(w), TRANSPARENT);
             return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+
+        case WM_SIZE:
+            if (st) EditorLayout(hwnd, st);   // re-anchor controls to the new size
+            return 0;
+
+        case WM_GETMINMAXINFO: {
+            // Don't let the window shrink below the base design size.
+            UINT dpi = st ? st->dpi : GetDpiForWindow(hwnd);
+            RECT rc{ 0, 0, MulDiv(kEdClientW, dpi, 96), MulDiv(kEdClientH, dpi, 96) };
+            DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+            DWORD ex    = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+            AdjustWindowRectExForDpi(&rc, style, FALSE, ex, dpi);
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(l);
+            mmi->ptMinTrackSize.x = rc.right - rc.left;
+            mmi->ptMinTrackSize.y = rc.bottom - rc.top;
+            return 0;
+        }
 
         case WM_DPICHANGED:
             if (st) {
@@ -2205,7 +2817,8 @@ void OpenConfigEditor(HWND owner) {
     MONITORINFO mi{ sizeof(mi) };
     GetMonitorInfoW(hm, &mi);
 
-    DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+                    WS_MAXIMIZEBOX | WS_THICKFRAME;   // resizable
     DWORD exStyle = WS_EX_CONTROLPARENT;
     RECT rc{ 0, 0, MulDiv(kEdClientW, dpiX, 96), MulDiv(kEdClientH, dpiX, 96) };
     AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpiX);
@@ -2213,7 +2826,8 @@ void OpenConfigEditor(HWND owner) {
     int wx = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
     int wy = mi.rcWork.top  + ((mi.rcWork.bottom - mi.rcWork.top) - wh) / 2;
 
-    g_hEditor = CreateWindowExW(exStyle, kEditorClass, L"MultiMonitorPanel — настройки",
+    std::wstring title = L"MultiMonitorPanel v" + std::wstring(kVersion) + L" — " + T(S_ED_TITLE_SUFFIX);
+    g_hEditor = CreateWindowExW(exStyle, kEditorClass, title.c_str(),
                                 style, wx, wy, ww, wh, nullptr, nullptr, g_hInst, nullptr);
     if (!g_hEditor) return;
     ShowWindow(g_hEditor, SW_SHOW);
@@ -2222,16 +2836,29 @@ void OpenConfigEditor(HWND owner) {
 
 void ShowContextMenu(HWND hwnd) {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING,             MENU_GUIEDIT,    L"Edit config…");
-    AppendMenuW(m, MF_STRING,             MENU_RELOAD,     L"Reload config");
-    AppendMenuW(m, MF_STRING,             MENU_SETDEFAULT, L"Set default config");
-    AppendMenuW(m, MF_STRING,             MENU_ERASE,      L"Erase config");
+    AppendMenuW(m, MF_STRING,             MENU_GUIEDIT,    T(S_MENU_EDIT));
+    AppendMenuW(m, MF_STRING,             MENU_RELOAD,     T(S_MENU_RELOAD));
+    AppendMenuW(m, MF_STRING,             MENU_SETDEFAULT, T(S_MENU_SETDEFAULT));
+    AppendMenuW(m, MF_STRING,             MENU_ERASE,      T(S_MENU_ERASE));
     AppendMenuW(m, MF_SEPARATOR,          0,               nullptr);
-    AppendMenuW(m, MF_STRING,             MENU_FOLDER, L"Open app folder (ico)");
+    AppendMenuW(m, MF_STRING,             MENU_FOLDER, T(S_MENU_FOLDER));
+
+    // Language submenu — built-in ru/en plus any extra lang\*.lang. A radio
+    // mark shows the active language; items map to MENU_LANG_BASE + index.
+    std::vector<std::pair<std::wstring, std::wstring>> langs = ListLanguages();
+    HMENU langMenu = CreatePopupMenu();
+    for (size_t i = 0; i < langs.size(); ++i) {
+        UINT flags = MF_STRING | (langs[i].first == g_lang ? MF_CHECKED : 0);
+        AppendMenuW(langMenu, flags, MENU_LANG_BASE + static_cast<int>(i),
+                    langs[i].second.c_str());
+    }
+    AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(langMenu), T(S_MENU_LANGUAGE));
+
     AppendMenuW(m, MF_SEPARATOR,          0,           nullptr);
-    AppendMenuW(m, MF_STRING,             MENU_EXIT,   L"Exit");
+    AppendMenuW(m, MF_STRING,             MENU_EXIT,   T(S_MENU_EXIT));
     AppendMenuW(m, MF_SEPARATOR,          0,           nullptr);
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0,           L"© Evgenii Shapovalov 2026");
+    std::wstring aboutLabel = std::wstring(T(S_MENU_ABOUT)) + L" (v" + kVersion + L")";
+    AppendMenuW(m, MF_STRING,             MENU_ABOUT,  aboutLabel.c_str());
 
     // Per-item icons. Bitmaps must stay alive until after TrackPopupMenu.
     int px = MulDiv(16, GetDpiForWindow(hwnd), 96);
@@ -2243,6 +2870,7 @@ void ShowContextMenu(HWND hwnd) {
     SetMenuIcon(m, MENU_ERASE,      StockIcon(SIID_RECYCLER),    px, keep);
     SetMenuIcon(m, MENU_FOLDER,     StockIcon(SIID_FOLDER),      px, keep);
     SetMenuIcon(m, MENU_EXIT,       StockIcon(SIID_DELETE),      px, keep);
+    SetMenuIcon(m, MENU_ABOUT,      StockIcon(SIID_INFO),        px, keep);
 
     POINT pt;
     GetCursorPos(&pt);
@@ -2251,36 +2879,45 @@ void ShowContextMenu(HWND hwnd) {
     UINT cmd = TrackPopupMenu(m,
                               TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                               pt.x, pt.y, 0, hwnd, nullptr);
-    DestroyMenu(m);
+    DestroyMenu(m);   // also destroys the attached langMenu submenu
     for (HBITMAP hb : keep) if (hb) DeleteObject(hb);
+
+    // Language picked: persist + reload strings + rebuild panels (and editor).
+    if (static_cast<int>(cmd) >= MENU_LANG_BASE &&
+        static_cast<int>(cmd) < MENU_LANG_BASE + static_cast<int>(langs.size())) {
+        const std::wstring& code = langs[cmd - MENU_LANG_BASE].first;
+        if (code != g_lang) {
+            SaveLanguageCode(code);
+            LoadLanguage(code);
+            EnsureInfoFile();                   // regenerate info.txt in the new language
+            if (g_hEditor) {                    // reopen the editor so its labels refresh
+                DestroyWindow(g_hEditor);
+                OpenConfigEditor(hwnd);
+            }
+        }
+        return;
+    }
 
     switch (cmd) {
         case MENU_GUIEDIT:
             OpenConfigEditor(hwnd);
             break;
+        case MENU_ABOUT:
+            AboutDialog(hwnd);
+            break;
         case MENU_RELOAD:
             PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
             break;
         case MENU_SETDEFAULT:
-            if (ConfirmDialog(hwnd,
-                    L"Заменить кнопки образцовым набором?",
-                    L"На всех мониторах кнопки заменятся стандартным набором — "
-                    L"Проводник, Калькулятор, CMD и другие. Заодно это наглядный "
-                    L"пример всех возможностей: блоки слева, по центру и справа, "
-                    L"разделители, запуск от имени администратора, своя иконка и "
-                    L"аргументы.",
-                    L"Заменить", TD_WARNING_ICON)) {
+            if (ConfirmDialog(hwnd, T(S_DLG_SETDEF_TITLE), T(S_DLG_SETDEF_BODY),
+                    T(S_DLG_SETDEF_OK), TD_WARNING_ICON)) {
                 SetDefaultConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
             }
             break;
         case MENU_ERASE:
-            if (ConfirmDialog(hwnd,
-                    L"Убрать все кнопки?",
-                    L"Кнопки исчезнут со всех мониторов, и панели станут пустыми.\n\n"
-                    L"Стандартный набор всегда возвращается через меню → "
-                    L"«Set default config».",
-                    L"Убрать", TD_WARNING_ICON)) {
+            if (ConfirmDialog(hwnd, T(S_DLG_ERASE_TITLE), T(S_DLG_ERASE_BODY),
+                    T(S_DLG_ERASE_OK), TD_WARNING_ICON)) {
                 EraseConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
             }
