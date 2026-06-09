@@ -29,6 +29,7 @@
 #include <commoncontrols.h>
 #include <commdlg.h>               // GetOpenFileNameW for the config editor's file pickers
 #include <objbase.h>
+#include <shobjidl.h>              // IFileOpenDialog (folder picker for icon_dir)
 #include <gdiplus.h>
 
 #include <string>
@@ -59,14 +60,15 @@ constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
 // Release metadata — shown in the About dialog and the editor title bar.
-constexpr wchar_t kVersion[]      = L"1.0.0";
+constexpr wchar_t kVersion[]      = L"1.1.0";
 constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
-constexpr wchar_t kReleaseDate[]  = L"2026-06-09";
+constexpr wchar_t kReleaseDate[]  = L"2026-06-10";
 constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
 
 constexpr UINT WM_APPBAR_CB       = WM_APP + 1;
 constexpr UINT WM_MMP_REBUILD     = WM_APP + 10;
 constexpr UINT WM_MMP_RELOAD      = WM_APP + 11;
+constexpr UINT WM_MMP_RELANG      = WM_APP + 12;   // editor: re-apply UI language in place
 
 constexpr int  BTN_ID_BASE        = 1000;
 constexpr int  MENU_RELOAD        = 2001;
@@ -104,6 +106,7 @@ constexpr int  IDC_APPLY          = 3021;
 constexpr int  IDC_BTN_ADDSEP     = 3022;
 constexpr int  IDC_MON_ADD        = 3023;
 constexpr int  IDC_MON_DEL        = 3024;
+constexpr int  IDC_ICONDIR_BROWSE = 3025;
 
 constexpr int  DEFAULT_HEIGHT_DIP = 48;
 constexpr int  MIN_HEIGHT_DIP     = 24;
@@ -164,6 +167,7 @@ HWND          g_hEditor = nullptr;   // built-in config editor (single instance)
 GlobalCfg     g_global;
 std::vector<std::unique_ptr<PanelWindow>> g_panels;
 HANDLE        g_mutex   = nullptr;
+std::wstring  g_lang    = L"ru";     // active UI language code (see localization)
 } // namespace
 
 // -------------------------- forward declarations ---------------------
@@ -443,6 +447,16 @@ void WriteGlobal(HKEY root, int heightDip, const std::wstring& iconDir) {
     RegWriteStr(root, L"icon_dir", iconDir);
 }
 
+// Re-persist the active UI language. Button config and language share one root
+// key, and every "rewrite the branch" path (editor save, set-default, erase)
+// calls RegDeleteTree first — without this the `language` value would be wiped,
+// silently resetting the user's choice on the next start.
+void WriteLanguageValue(HKEY root) {
+    RegSetValueExW(root, L"language", 0, REG_SZ,
+                   reinterpret_cast<const BYTE*>(g_lang.c_str()),
+                   static_cast<DWORD>((g_lang.size() + 1) * sizeof(wchar_t)));
+}
+
 void WriteButton(HKEY root, int mon, int btn, const ButtonCfg& b) {
     wchar_t sub[64]{};
     _snwprintf_s(sub, _countof(sub), _TRUNCATE, L"monitor_%d\\button_%d", mon, btn);
@@ -465,6 +479,10 @@ void WriteButton(HKEY root, int mon, int btn, const ButtonCfg& b) {
 // arranged to show off every feature at a glance — left/center/right blocks,
 // separators, run-as-admin, an icon override, command-line args, a folder shortcut.
 std::vector<ButtonCfg> DefaultButtons() {
+    bool ru = (g_lang == L"ru");
+    // Pick the label in the active language (sample content, not part of the
+    // string table — the user replaces these anyway).
+    auto L = [ru](const wchar_t* rus, const wchar_t* eng) { return ru ? rus : eng; };
     auto mk = [](const wchar_t* label, const wchar_t* target, const wchar_t* args,
                  const wchar_t* icon, bool admin, BtnAlign align, bool console = false) {
         ButtonCfg b;
@@ -478,21 +496,21 @@ std::vector<ButtonCfg> DefaultButtons() {
     };
     using A = BtnAlign;
     return {
-        // — LEFT block: проводник и папки —
-        mk(L"Проводник",         L"explorer.exe",             L"",  L"",            false, A::Left),
-        mk(L"Загрузки",          L"%USERPROFILE%\\Downloads", L"",  L"download.png",false, A::Left),
-        sep(A::Left),                                  // разделитель внутри левого блока
-        mk(L"Блокнот",           L"notepad.exe",              L"",  L"",            false, A::Left),
-        mk(L"Калькулятор",       L"calc.exe",                 L"",  L"",            false, A::Left),
+        // — LEFT block: explorer & folders —
+        mk(L(L"Проводник", L"Explorer"),    L"explorer.exe",             L"",  L"",            false, A::Left),
+        mk(L(L"Загрузки", L"Downloads"),    L"%USERPROFILE%\\Downloads", L"",  L"download.png",false, A::Left),
+        sep(A::Left),                                  // separator inside the left block
+        mk(L(L"Блокнот", L"Notepad"),       L"notepad.exe",              L"",  L"",            false, A::Left),
+        mk(L(L"Калькулятор", L"Calculator"),L"calc.exe",                 L"",  L"",            false, A::Left),
         // — CENTER block —
-        mk(L"Paint",             L"mspaint.exe",              L"",  L"",            false, A::Center),
-        mk(L"Ping",              L"cmd.exe", L"/k ping 127.0.0.1", L"",            false, A::Center, true), // args + console
-        // — RIGHT block: система, часть от админа —
-        mk(L"Панель управления", L"control.exe",              L"",  L"",            false, A::Right),
-        mk(L"Диспетчер задач",   L"taskmgr.exe",              L"",  L"",            false, A::Right),
-        sep(A::Right),                                 // разделитель внутри правого блока
-        mk(L"CMD (админ)",       L"cmd.exe",                  L"",  L"",            true,  A::Right, true),  // console
-        mk(L"Реестр (админ)",    L"regedit.exe",              L"",  L"",            true,  A::Right),
+        mk(L"Paint",                        L"mspaint.exe",              L"",  L"",            false, A::Center),
+        mk(L"Ping",                         L"cmd.exe", L"/k ping 127.0.0.1", L"",            false, A::Center, true), // args + console
+        // — RIGHT block: system, some as admin —
+        mk(L(L"Панель управления", L"Control Panel"), L"control.exe",    L"",  L"",            false, A::Right),
+        mk(L(L"Диспетчер задач", L"Task Manager"),    L"taskmgr.exe",    L"",  L"",            false, A::Right),
+        sep(A::Right),                                 // separator inside the right block
+        mk(L(L"CMD (админ)", L"CMD (admin)"),         L"cmd.exe",        L"",  L"",            true,  A::Right, true),  // console
+        mk(L(L"Реестр (админ)", L"Registry (admin)"), L"regedit.exe",    L"",  L"",            true,  A::Right),
     };
 }
 
@@ -513,6 +531,7 @@ void EraseConfig() {
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegSubkey, 0, nullptr, 0,
                         KEY_READ | KEY_WRITE | DELETE, nullptr, &root, nullptr) == ERROR_SUCCESS) {
         RegDeleteTree(root, nullptr);   // remove monitor_* + values, keep the empty root
+        WriteLanguageValue(root);       // language is a UI pref — survive the wipe
         RegCloseKey(root);
     }
 }
@@ -525,6 +544,7 @@ void SetDefaultConfig() {
                         KEY_READ | KEY_WRITE | DELETE, nullptr, &root, nullptr) == ERROR_SUCCESS) {
         RegDeleteTree(root, nullptr);
         WriteDefaultConfig(root);
+        WriteLanguageValue(root);       // preserve the chosen language across the wipe
         RegCloseKey(root);
     }
 }
@@ -722,9 +742,9 @@ enum Str {
     S_ED_ICON, S_ED_EDGE, S_ED_LEFT, S_ED_CENTER, S_ED_RIGHT,
     S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
     S_ED_MON_FMT, S_ED_GROUP_LEFT, S_ED_GROUP_CENTER, S_ED_GROUP_RIGHT,
-    S_ED_ROW_UNNAMED, S_ED_FIELD_SEP,
+    S_ED_ROW_UNNAMED, S_ED_FIELD_SEP, S_ED_PICKDIR,
     S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
-    S_TIP_MONADD, S_TIP_MONDEL,
+    S_TIP_MONADD, S_TIP_MONDEL, S_TIP_ICONDIR,
     S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
     S_COUNT
 };
@@ -780,7 +800,7 @@ const StrDef kStrings[] = {
     { L"ed.title.suffix",  L"настройки",                L"settings" },
     { L"ed.monitor",       L"Монитор:",                 L"Monitor:" },
     { L"ed.height",        L"Высота:",                  L"Height:" },
-    { L"ed.icons",         L"Иконки:",                  L"Icons:" },
+    { L"ed.icons",         L"Папка иконок:",            L"Icon folder:" },
     { L"ed.grp.buttons",   L"Кнопки",                   L"Buttons" },
     { L"ed.grp.prop",      L"Свойство кнопки",          L"Button properties" },
     { L"ed.label",         L"Подпись:",                 L"Label:" },
@@ -803,6 +823,7 @@ const StrDef kStrings[] = {
     { L"ed.group.right",   L"——— справа ———",           L"——— right ———" },
     { L"ed.row.unnamed",   L"(без подписи)",            L"(no label)" },
     { L"ed.field.sep",     L"(разделитель)",            L"(separator)" },
+    { L"ed.pickdir",       L"Выберите папку с иконками", L"Choose the icon folder" },
     { L"tip.edge",
       L"К какому краю полосы прижать кнопку: левый край, центр или правый. "
       L"Например: папки слева, программы справа.",
@@ -825,6 +846,13 @@ const StrDef kStrings[] = {
     { L"tip.monadd",       L"Добавить монитор (для экрана, который сейчас не подключён).",
                            L"Add a monitor (for a screen that is not connected right now)." },
     { L"tip.mondel",       L"Убрать последний монитор.", L"Remove the last monitor." },
+    { L"tip.icondir",
+      L"Папка, откуда берутся иконки по имени файла. По умолчанию «ico» — "
+      L"подпапка рядом с panel.exe (так комплект остаётся переносимым). "
+      L"Кнопка «…» — выбрать другую папку (запишется полный путь).",
+      L"Folder the icons are taken from by file name. Default “ico” is a "
+      L"subfolder next to panel.exe (keeps the kit portable). The “…” button "
+      L"picks another folder (the full path is stored)." },
     { L"filter.programs",  L"Программы (*.exe;*.lnk;*.bat;*.cmd)",
                            L"Programs (*.exe;*.lnk;*.bat;*.cmd)" },
     { L"filter.images",    L"Изображения (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)",
@@ -833,8 +861,7 @@ const StrDef kStrings[] = {
 };
 static_assert(_countof(kStrings) == S_COUNT, "kStrings out of sync with enum Str");
 
-std::wstring g_lang = L"ru";
-std::wstring g_str[S_COUNT];
+std::wstring g_str[S_COUNT];   // g_lang lives in the globals block (needed earlier)
 
 const wchar_t* T(Str id) { return g_str[id].c_str(); }
 
@@ -853,12 +880,15 @@ std::wstring ReadFileUtf8(const std::wstring& path) {
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return L"";
     DWORD size = GetFileSize(h, nullptr);
+    if (size == INVALID_FILE_SIZE) { CloseHandle(h); return L""; }  // check before clamp
+    constexpr DWORD kMaxLang = 4 * 1024 * 1024;   // a lang file is a few KB; cap so a
+    if (size > kMaxLang) size = kMaxLang;          // stray huge/corrupt file can't OOM us
     std::string bytes;
-    if (size && size != INVALID_FILE_SIZE) {
+    if (size) {
         bytes.resize(size);
         DWORD got = 0;
-        ReadFile(h, &bytes[0], size, &got, nullptr);
-        bytes.resize(got);
+        if (ReadFile(h, &bytes[0], size, &got, nullptr)) bytes.resize(got);
+        else bytes.clear();
     }
     CloseHandle(h);
     const char* p = bytes.c_str();
@@ -912,7 +942,8 @@ std::wstring ReadLangName(const std::wstring& code) {
         size_t eol = text.find(L'\n', pos);
         std::wstring line = TrimW(text.substr(pos, eol == std::wstring::npos ? std::wstring::npos : eol - pos));
         pos = (eol == std::wstring::npos) ? text.size() : eol + 1;
-        if (line.rfind(L"lang.name", 0) == 0) {
+        if (line.rfind(L"lang.name", 0) == 0 &&
+            (line.size() == 9 || line[9] == L'=' || line[9] == L' ' || line[9] == L'\t')) {
             size_t eq = line.find(L'=');
             if (eq != std::wstring::npos) return TrimW(line.substr(eq + 1));
         }
@@ -924,10 +955,9 @@ std::wstring ReadLangName(const std::wstring& code) {
 void LoadLanguage(const std::wstring& code) {
     g_lang = code.empty() ? L"ru" : code;
     ApplyBuiltinDefaults(g_lang != L"ru");   // ru base for ru, en base for everything else
-    if (g_lang != L"ru" && g_lang != L"en")
-        OverlayLangFile(g_lang, nullptr);    // custom language: en base + file
-    else
-        OverlayLangFile(g_lang, nullptr);    // built-in: still allow user tweaks via file
+    // Overlay the file for every language: a custom code gets en base + its file,
+    // and built-in ru/en still pick up any user tweaks in their .lang file.
+    OverlayLangFile(g_lang, nullptr);
 }
 
 // Persist the chosen language to the registry.
@@ -958,10 +988,14 @@ std::wstring DetectLanguageCode() {
 void WriteLangTemplate(const std::wstring& code, bool english) {
     std::string out;
     auto append = [&out](const std::wstring& w) {
-        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
-        if (n <= 1) return;
-        std::string s(n - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n - 1, nullptr, nullptr);
+        if (w.empty()) return;
+        // Pass the exact wide length (not -1) so the UTF-8 size excludes the
+        // null terminator and the conversion writes the full content cleanly.
+        int len = static_cast<int>(w.size());
+        int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), len, nullptr, 0, nullptr, nullptr);
+        if (n <= 0) return;
+        std::string s(n, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), len, &s[0], n, nullptr, nullptr);
         out += s;
     };
     append(L"# MultiMonitorPanel language file (UTF-8). Copy to <code>.lang and\n");
@@ -984,10 +1018,17 @@ void WriteLangTemplate(const std::wstring& code, bool english) {
     CloseHandle(h);
 }
 
+// Seed ru.lang / en.lang ONLY if missing — never clobber a user's edits on a
+// later start. Missing keys still fall back to the built-in defaults
+// (ApplyBuiltinDefaults runs before OverlayLangFile), so a file from an older
+// build keeps working; to refresh a template, delete the file and restart.
+// Mirrors the "already configured → leave it" rule of EnsureRegistryConfig.
 void EnsureLangFiles() {
     CreateDirectoryW(LangDir().c_str(), nullptr);
-    WriteLangTemplate(L"ru", false);
-    WriteLangTemplate(L"en", true);
+    if (GetFileAttributesW(LangFilePath(L"ru").c_str()) == INVALID_FILE_ATTRIBUTES)
+        WriteLangTemplate(L"ru", false);
+    if (GetFileAttributesW(LangFilePath(L"en").c_str()) == INVALID_FILE_ATTRIBUTES)
+        WriteLangTemplate(L"en", true);
 }
 
 // Enumerate available languages: built-in ru/en plus any extra lang\*.lang.
@@ -1932,7 +1973,7 @@ bool ConfirmDialog(HWND hwnd, PCWSTR mainInstr, PCWSTR content,
                    PCWSTR okLabel, PCWSTR icon) {
     const TASKDIALOG_BUTTON buttons[] = {
         { IDOK,     okLabel },
-        { IDCANCEL, L"Отмена" },
+        { IDCANCEL, T(S_COMMON_CANCEL) },
     };
     TASKDIALOGCONFIG cfg{ sizeof(cfg) };
     cfg.hwndParent         = hwnd;
@@ -1995,7 +2036,8 @@ struct EditorState {
     int   curBtn  = -1;                             // index into mons[curMon], or -1
     UINT  dpi     = 96;
     HFONT font    = nullptr;
-    bool  loading = false;                         // guard: silence EN_CHANGE/clicks while filling fields
+    HWND  tip     = nullptr;                        // tooltip control (recreated on language change)
+    bool  loading = false;                        // guard: silence EN_CHANGE/clicks while filling fields
     bool  dirty   = false;
     std::vector<int> rowMap;                       // listbox row → model index (-1 = section header)
 };
@@ -2069,8 +2111,9 @@ const EdCtl kEd[] = {
     { IDC_MON_DEL,       K_BTN,     L"−",         196,  12,  24, 23 },
     { IDC_LBL_H,         K_STATIC,  L"Высота:",   238,  16,  46, 18 },
     { IDC_HEIGHT_EDIT,   K_EDITNUM, L"",          286,  12,  44, 23 },
-    { IDC_LBL_ICODIR,    K_STATIC,  L"Иконки:",   344,  16,  46, 18 },
-    { IDC_ICONDIR_EDIT,  K_EDIT,    L"",          392,  12, 180, 23, A_WSTRETCH },
+    { IDC_LBL_ICODIR,    K_STATIC,  L"Папка иконок:", 344, 16, 90, 18 },
+    { IDC_ICONDIR_EDIT,  K_EDIT,    L"",          436,  12, 100, 23, A_WSTRETCH },
+    { IDC_ICONDIR_BROWSE,K_BTN,     L"...",        540,  12,  32, 23, A_MOVEX },
     // left column — button list
     { IDC_GRP_BTN,       K_GROUP,   L"Кнопки",     12,  44, 250, 250, A_HSTRETCH },
     { IDC_BTN_LIST,      K_LIST,    L"",           24,  64, 226, 218, A_HSTRETCH },
@@ -2103,7 +2146,10 @@ const EdCtl kEd[] = {
     { IDCANCEL,          K_BTN,     L"Отмена",    408, 372,  78, 26, A_MOVEX | A_MOVEY },
     { IDC_APPLY,         K_BTN,     L"Применить", 494, 372,  78, 26, A_MOVEX | A_MOVEY },
 };
-constexpr int kEdClientW = 584, kEdClientH = 404;   // DIP
+constexpr int kEdClientW = 584, kEdClientH = 404;   // DIP — base design / minimum size
+constexpr int kEdOpenW   = 1000;                    // DIP — initial client width (anchors
+                                                    // stretch the fields to fill it; still
+                                                    // shrinkable down to kEdClientW)
 
 void EditorMakeFont(EditorState* st) {
     if (st->font) { DeleteObject(st->font); st->font = nullptr; }
@@ -2206,12 +2252,24 @@ void EditorLoadModel(EditorState* st) {
     if (root) RegCloseKey(root);
 
     // Show one tab per physical monitor, but never fewer than the highest
-    // monitor_<k> that already has buttons (so a 3-monitor config stays editable
-    // on a laptop that currently has one screen).
+    // monitor_<k> present in the registry (so a 3-monitor config stays editable
+    // on a laptop that currently has one screen). One enum pass over the root's
+    // subkeys instead of probing monitor_1..16 individually.
     int n = static_cast<int>(g_panels.size());
-    for (int k = 16; k >= 1; --k)
-        if (!LoadButtonsForMonitor(k).empty()) { if (k > n) n = k; break; }
+    HKEY mroot = OpenRoot(KEY_READ);
+    if (mroot) {
+        for (DWORD i = 0; ; ++i) {
+            wchar_t name[128];
+            DWORD cch = _countof(name);
+            if (RegEnumKeyExW(mroot, i, name, &cch, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            int k = 0;
+            if (swscanf_s(name, L"monitor_%d", &k) == 1 && k > n) n = k;
+        }
+        RegCloseKey(mroot);
+    }
     if (n < 1) n = 1;
+    if (n > 16) n = 16;   // editor caps monitors at 16
 
     st->mons.assign(n, {});
     for (int i = 0; i < n; ++i) {
@@ -2227,15 +2285,19 @@ void EditorSaveModel(EditorState* st) {
         return;
     RegDeleteTree(root, nullptr);
     WriteGlobal(root, st->heightDip, st->iconDir);
+    WriteLanguageValue(root);           // keep the language; RegDeleteTree wiped it
     for (size_t mon = 0; mon < st->mons.size(); ++mon) {
         int btnNo = 0;
         for (const ButtonCfg& b : st->mons[mon]) {
             if (b.target.empty() && !b.isSeparator) continue;   // drop blank rows
             if (b.isSeparator) {
-                // Persist a clean separator — only the alignment matters.
-                ButtonCfg sepCfg;
-                sepCfg.isSeparator = true;
-                sepCfg.align       = b.align;
+                // Keep the entry's content (label/target/args/icon) so toggling
+                // the separator back into a button restores it; only admin/console
+                // are dropped — meaningless for a divider, and RunButton early-outs
+                // on a separator anyway.
+                ButtonCfg sepCfg = b;
+                sepCfg.runAsAdmin = false;
+                sepCfg.console    = false;
                 WriteButton(root, static_cast<int>(mon + 1), ++btnNo, sepCfg);
             } else {
                 WriteButton(root, static_cast<int>(mon + 1), ++btnNo, b);
@@ -2483,6 +2545,38 @@ void EditorBrowseIcon(HWND hwnd) {
     EdSetText(hwnd, IDC_ICON_EDIT, out);
 }
 
+// Folder picker for icon_dir. Uses the modern IFileOpenDialog (FOS_PICKFOLDERS)
+// to match the rest of the UI; COM is already initialised on this (main) thread.
+// If the chosen folder is exactly <exeDir>\ico, store the relative "ico" so the
+// portable default is preserved — otherwise store the absolute path.
+void EditorBrowseIconDir(HWND hwnd) {
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dlg))) || !dlg)
+        return;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dlg->SetTitle(T(S_ED_PICKDIR));
+    if (SUCCEEDED(dlg->Show(hwnd))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                std::wstring full = path, ico = GetExeDir();
+                if (!ico.empty() && ico.back() != L'\\') ico += L'\\';
+                ico += L"ico";
+                std::wstring out = (_wcsicmp(full.c_str(), ico.c_str()) == 0)
+                                       ? std::wstring(L"ico") : full;
+                EdSetText(hwnd, IDC_ICONDIR_EDIT, out.c_str());  // EN_CHANGE → flush + dirty
+                CoTaskMemFree(path);
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+}
+
 // ---- explanatory tooltips on the less-obvious controls ----
 void EditorAddTip(HWND tip, HWND hwnd, int id, const wchar_t* text) {
     TOOLINFOW ti{ sizeof(ti) };
@@ -2493,12 +2587,14 @@ void EditorAddTip(HWND tip, HWND hwnd, int id, const wchar_t* text) {
     SendMessageW(tip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
 }
 
-void EditorCreateTooltips(HWND hwnd) {
+void EditorCreateTooltips(HWND hwnd, EditorState* st) {
+    if (st && st->tip) { DestroyWindow(st->tip); st->tip = nullptr; }  // re-create on relang
     HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
         WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
         CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
         hwnd, nullptr, g_hInst, nullptr);          // child of the editor → auto-destroyed
     if (!tip) return;
+    if (st) st->tip = tip;
     SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 340);  // allow wrapped multi-line tips
     SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000);
 
@@ -2513,6 +2609,9 @@ void EditorCreateTooltips(HWND hwnd) {
     EditorAddTip(tip, hwnd, IDC_CHK_ADMIN,   T(S_TIP_ADMIN));
     EditorAddTip(tip, hwnd, IDC_MON_ADD,     T(S_TIP_MONADD));
     EditorAddTip(tip, hwnd, IDC_MON_DEL,     T(S_TIP_MONDEL));
+    const wchar_t* dirTip = T(S_TIP_ICONDIR);
+    EditorAddTip(tip, hwnd, IDC_ICONDIR_EDIT,   dirTip);
+    EditorAddTip(tip, hwnd, IDC_ICONDIR_BROWSE, dirTip);
 }
 
 // ---- grouping / reordering ----
@@ -2580,10 +2679,26 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             EdSetText(hwnd, IDC_ICONDIR_EDIT, st->iconDir);
             EditorRefreshList(hwnd, st);
             EditorLoadFields(hwnd, st);          // its tail resets st->loading = false
-            EditorCreateTooltips(hwnd);
+            EditorCreateTooltips(hwnd, st);
             st->dirty = false;                   // a freshly opened editor is clean
             return 0;
         }
+
+        case WM_MMP_RELANG:
+            // Language changed while open — relabel everything from the model in
+            // memory (no reload, so unsaved edits survive). dirty stays as it was.
+            if (st) {
+                EditorFlushFields(hwnd, st);     // capture the field being edited
+                EditorApplyTexts(hwnd);          // control captions
+                std::wstring title = L"MultiMonitorPanel v" + std::wstring(kVersion) +
+                                     L" — " + T(S_ED_TITLE_SUFFIX);
+                SetWindowTextW(hwnd, title.c_str());
+                EditorFillMonCombo(hwnd, st);    // "Монитор %d" / "Monitor %d"
+                EditorRefreshList(hwnd, st);     // section headers + row placeholders
+                EditorLoadFields(hwnd, st);      // separator placeholder text
+                EditorCreateTooltips(hwnd, st);  // tips in the new language (recreated)
+            }
+            return 0;
 
         case WM_COMMAND: {
             int id = LOWORD(w), code = HIWORD(w);
@@ -2712,8 +2827,9 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                         }
                     }
                     break;
-                case IDC_TARGET_BROWSE: EditorBrowseTarget(hwnd); break;
-                case IDC_ICON_BROWSE:   EditorBrowseIcon(hwnd);   break;
+                case IDC_TARGET_BROWSE:  EditorBrowseTarget(hwnd);  break;
+                case IDC_ICON_BROWSE:    EditorBrowseIcon(hwnd);    break;
+                case IDC_ICONDIR_BROWSE: EditorBrowseIconDir(hwnd); break;
 
                 case IDOK:
                     EditorFlushFields(hwnd, st);
@@ -2820,7 +2936,7 @@ void OpenConfigEditor(HWND owner) {
     DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
                     WS_MAXIMIZEBOX | WS_THICKFRAME;   // resizable
     DWORD exStyle = WS_EX_CONTROLPARENT;
-    RECT rc{ 0, 0, MulDiv(kEdClientW, dpiX, 96), MulDiv(kEdClientH, dpiX, 96) };
+    RECT rc{ 0, 0, MulDiv(kEdOpenW, dpiX, 96), MulDiv(kEdClientH, dpiX, 96) };
     AdjustWindowRectExForDpi(&rc, style, FALSE, exStyle, dpiX);
     int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
     int wx = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - ww) / 2;
@@ -2890,10 +3006,9 @@ void ShowContextMenu(HWND hwnd) {
             SaveLanguageCode(code);
             LoadLanguage(code);
             EnsureInfoFile();                   // regenerate info.txt in the new language
-            if (g_hEditor) {                    // reopen the editor so its labels refresh
-                DestroyWindow(g_hEditor);
-                OpenConfigEditor(hwnd);
-            }
+            // Refresh the open editor IN PLACE (don't destroy it — that would lose
+            // unsaved edits). It re-labels controls from the model already in memory.
+            if (g_hEditor) SendMessageW(g_hEditor, WM_MMP_RELANG, 0, 0);
         }
         return;
     }

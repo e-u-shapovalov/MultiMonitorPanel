@@ -170,8 +170,9 @@ Switch it from the **Язык / Language** menu (the choice is stored in the reg
 on first run it is auto-detected from the system locale).
 
 Strings live in `lang\<code>.lang` next to `panel.exe` (INI, UTF-8). The `ru.lang`
-and `en.lang` files are rewritten on every start from the built-in defaults, so
-they double as templates. **To add a language:**
+and `en.lang` files are created from the built-in defaults on first run (if
+missing) and act as templates; your edits to them are kept on later starts. To
+restore the original template, delete the file and restart. **To add a language:**
 
 1. Copy `lang\en.lang` to `lang\<code>.lang` (e.g. `de.lang`).
 2. Translate the right-hand side of each `key = value` line; set `lang.name` to
