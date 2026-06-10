@@ -743,6 +743,7 @@ enum Str {
     S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
     S_ED_MON_FMT, S_ED_GROUP_LEFT, S_ED_GROUP_CENTER, S_ED_GROUP_RIGHT,
     S_ED_ROW_UNNAMED, S_ED_FIELD_SEP, S_ED_PICKDIR,
+    S_ED_CTX_COPY, S_ED_CTX_PASTE,
     S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
     S_TIP_MONADD, S_TIP_MONDEL, S_TIP_ICONDIR,
     S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
@@ -824,6 +825,8 @@ const StrDef kStrings[] = {
     { L"ed.row.unnamed",   L"(без подписи)",            L"(no label)" },
     { L"ed.field.sep",     L"(разделитель)",            L"(separator)" },
     { L"ed.pickdir",       L"Выберите папку с иконками", L"Choose the icon folder" },
+    { L"ed.ctx.copy",      L"Копировать",               L"Copy" },
+    { L"ed.ctx.paste",     L"Вставить",                 L"Paste" },
     { L"tip.edge",
       L"К какому краю полосы прижать кнопку: левый край, центр или правый. "
       L"Например: папки слева, программы справа.",
@@ -2040,6 +2043,8 @@ struct EditorState {
     bool  loading = false;                        // guard: silence EN_CHANGE/clicks while filling fields
     bool  dirty   = false;
     std::vector<int> rowMap;                       // listbox row → model index (-1 = section header)
+    ButtonCfg clip;                                // copy/paste buffer for the list context menu
+    bool      hasClip = false;                     // is clip populated yet?
 };
 
 // Buttons are kept grouped by alignment (Left, then Center, then Right) so the
@@ -2660,6 +2665,69 @@ void EditorRebuildMonState(HWND hwnd, EditorState* st) {
     EditorLoadFields(hwnd, st);
 }
 
+// Right-click on the buttons list → copy / paste one button. Copy stashes the
+// selected entry into st->clip; paste drops a clone into the current monitor. So
+// a button can be duplicated (copy then paste on the same monitor) or carried to
+// another monitor (copy, switch the combo, paste). The clone keeps its own edge
+// group and lands at the end of it, just like a freshly added button.
+void EditorListContextMenu(HWND hwnd, EditorState* st, int sx, int sy) {
+    HWND lb = GetDlgItem(hwnd, IDC_BTN_LIST);
+
+    if (sx == -1 && sy == -1) {
+        // Keyboard invocation (Shift+F10 / menu key) — anchor under the current row.
+        int r = static_cast<int>(SendMessageW(lb, LB_GETCURSEL, 0, 0));
+        RECT ri{};
+        POINT p{ 0, 0 };
+        if (r >= 0 && SendMessageW(lb, LB_GETITEMRECT, r, reinterpret_cast<LPARAM>(&ri)) != LB_ERR)
+            p = POINT{ ri.left, ri.bottom };
+        ClientToScreen(lb, &p);
+        sx = p.x; sy = p.y;
+    } else {
+        // A list-box doesn't select on right-click — do it ourselves so the menu
+        // acts on the row under the cursor (header rows snap to a nearby button).
+        POINT cp{ sx, sy };
+        ScreenToClient(lb, &cp);
+        DWORD hit = static_cast<DWORD>(
+            SendMessageW(lb, LB_ITEMFROMPOINT, 0, MAKELPARAM(cp.x, cp.y)));
+        if (HIWORD(hit) == 0) {                     // 0 = a real item sits under the point
+            EditorFlushFields(hwnd, st);
+            SendMessageW(lb, LB_SETCURSEL, LOWORD(hit), 0);
+            st->curBtn = EditorSelToModel(hwnd, st);
+            int rr = EditorRowForModel(st, st->curBtn);
+            if (rr >= 0) SendMessageW(lb, LB_SETCURSEL, rr, 0);
+            EditorLoadFields(hwnd, st);
+        }
+    }
+
+    constexpr UINT CTX_COPY = 1, CTX_PASTE = 2;
+    bool canCopy = EditorHasSel(st);
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (canCopy     ? 0u : MF_GRAYED), CTX_COPY,  T(S_ED_CTX_COPY));
+    AppendMenuW(m, MF_STRING | (st->hasClip ? 0u : MF_GRAYED), CTX_PASTE, T(S_ED_CTX_PASTE));
+
+    SetForegroundWindow(hwnd);
+    UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                              sx, sy, 0, hwnd, nullptr);
+    DestroyMenu(m);
+
+    if (cmd == CTX_COPY && canCopy) {
+        EditorFlushFields(hwnd, st);                // capture in-flight edits first
+        st->clip    = st->mons[st->curMon][st->curBtn];
+        st->hasClip = true;
+    } else if (cmd == CTX_PASTE && st->hasClip) {
+        EditorFlushFields(hwnd, st);
+        auto& vec = st->mons[st->curMon];
+        vec.push_back(st->clip);                    // clone keeps its own edge group
+        EditorRegroup(vec);
+        st->curBtn = -1;                            // select the freshly pasted clone
+        for (int i = 0; i < static_cast<int>(vec.size()); ++i)
+            if (vec[i].align == st->clip.align) st->curBtn = i;
+        st->dirty = true;
+        EditorRefreshList(hwnd, st);
+        EditorLoadFields(hwnd, st);
+    }
+}
+
 LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     EditorState* st = EdState(hwnd);
     switch (msg) {
@@ -2854,6 +2922,16 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+
+        case WM_CONTEXTMENU:
+            // Right-click on the buttons list → copy / paste. lParam carries signed
+            // screen coords (or -1,-1 from the keyboard), so cast through short.
+            if (st && reinterpret_cast<HWND>(w) == GetDlgItem(hwnd, IDC_BTN_LIST)) {
+                EditorListContextMenu(hwnd, st,
+                    static_cast<short>(LOWORD(l)), static_cast<short>(HIWORD(l)));
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, w, l);
 
         case WM_CTLCOLORSTATIC:
             // Labels / groupboxes / checkboxes paint cleanly on the dialog face.
