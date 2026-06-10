@@ -23,7 +23,7 @@ Open the latest GitHub Release:
 
 In **Assets**, download the ready-to-run program:
 
-- current `v1.0.0` release: **`panel.exe`**;
+- current release: **`panel.exe`**;
 - future releases may provide a zip archive or installer in the same **Assets** block.
 
 If you only want to run the app, do **not** download **Source code** and do **not**

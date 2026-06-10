@@ -19,7 +19,7 @@ shcore ship with every Windows 10/11).
 
 1. Open
    [Releases / Latest](https://github.com/e-u-shapovalov/MultiMonitorPanel/releases/latest).
-2. In **Assets**, download the ready-to-run program. In the current `v1.0.0`
+2. In **Assets**, download the ready-to-run program. In the current
    release, this is `panel.exe`.
 3. Put `panel.exe` into a permanent folder, for example
    `C:\Tools\MultiMonitorPanel`.

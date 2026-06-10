@@ -19,7 +19,7 @@ Windows вырезает под неё полосу из рабочей обла
 
 1. Открой страницу
    [Releases / Latest](https://github.com/e-u-shapovalov/MultiMonitorPanel/releases/latest).
-2. В блоке **Assets** скачай готовый файл программы. В текущем релизе `v1.0.0`
+2. В блоке **Assets** скачай готовый файл программы. В текущем релизе
    это `panel.exe`.
 3. Положи `panel.exe` в постоянную папку, например
    `C:\Tools\MultiMonitorPanel`.

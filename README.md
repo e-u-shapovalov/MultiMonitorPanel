@@ -47,7 +47,7 @@ English version: [README.en.md](README.en.md)
 1. Откройте страницу [последнего релиза](https://github.com/e-u-shapovalov/MultiMonitorPanel/releases/latest).
 2. Найдите блок **Assets** внизу описания релиза.
 3. Скачайте готовый файл программы:
-   - в текущем релизе `v1.0.0` это **`panel.exe`**;
+   - в текущем релизе это **`panel.exe`**;
    - если в будущем появится архив вида `MultiMonitorPanel-...-win64.zip`, скачивайте его из **Assets**.
 4. Если скачали `panel.exe`, положите его в удобную папку, например:
 
@@ -61,8 +61,8 @@ English version: [README.en.md](README.en.md)
 **Source code (tar.gz)**. Это исходный код для разработчиков. Обычному
 пользователю нужен файл из **Assets**, сейчас это `panel.exe`.
 
-Прямая ссылка на текущий релиз:
-[MultiMonitorPanel v1.0.0](https://github.com/e-u-shapovalov/MultiMonitorPanel/releases/tag/v1.0.0)
+Прямая ссылка на последний релиз:
+[MultiMonitorPanel — последний релиз](https://github.com/e-u-shapovalov/MultiMonitorPanel/releases/latest)
 
 ### Если вы не умеете пользоваться GitHub
 
