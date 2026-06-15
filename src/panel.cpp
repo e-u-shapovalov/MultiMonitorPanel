@@ -1916,6 +1916,35 @@ HICON StockIcon(SHSTOCKICONID id) {
     return nullptr;
 }
 
+HICON ReloadMenuIcon(int px) {
+    if (px <= 0) return nullptr;
+
+    Gdiplus::Bitmap bmp(px, px, PixelFormat32bppPARGB);
+    Gdiplus::Graphics g(&bmp);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+    COLORREF rgb = GetSysColor(COLOR_HOTLIGHT);
+    Gdiplus::Color color(255, GetRValue(rgb), GetGValue(rgb), GetBValue(rgb));
+    const float stroke = std::max(2.0f, px * 0.14f);
+    const float inset = stroke * 1.8f;
+
+    Gdiplus::Pen pen(color, stroke);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    Gdiplus::AdjustableArrowCap arrow(stroke * 1.45f, stroke * 1.25f, TRUE);
+    pen.SetCustomEndCap(&arrow);
+
+    Gdiplus::RectF arc(inset, inset,
+                       static_cast<float>(px) - inset * 2.0f,
+                       static_cast<float>(px) - inset * 2.0f);
+    g.DrawArc(&pen, arc, 25.0f, 275.0f);
+
+    HICON hIcon = nullptr;
+    if (bmp.GetHICON(&hIcon) != Gdiplus::Ok) return nullptr;
+    return hIcon;
+}
+
 HBITMAP IconToMenuBitmap(HICON hIcon, int px) {
     if (!hIcon) return nullptr;
     BITMAPINFO bi{};
@@ -3059,7 +3088,7 @@ void ShowContextMenu(HWND hwnd) {
     if (px < 16) px = 16;
     std::vector<HBITMAP> keep;
     SetMenuIcon(m, MENU_GUIEDIT,    StockIcon(SIID_RENAME),      px, keep);
-    SetMenuIcon(m, MENU_RELOAD,     StockIcon(SIID_KEY),         px, keep);
+    SetMenuIcon(m, MENU_RELOAD,     ReloadMenuIcon(px),          px, keep);
     SetMenuIcon(m, MENU_SETDEFAULT, StockIcon(SIID_APPLICATION), px, keep);
     SetMenuIcon(m, MENU_ERASE,      StockIcon(SIID_RECYCLER),    px, keep);
     SetMenuIcon(m, MENU_FOLDER,     StockIcon(SIID_FOLDER),      px, keep);
