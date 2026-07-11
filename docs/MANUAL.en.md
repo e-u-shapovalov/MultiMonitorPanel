@@ -81,7 +81,8 @@ or text files. It is **resizable** (drag an edge), so long arguments are fully
 visible.
 
 - **Top:** monitor picker (the **+/−** buttons add and remove a monitor — you can
-  set up a screen that is not connected right now), bar height, icon folder.
+  set up a screen that is not connected right now; the **⇄** button swaps the current
+  monitor's button set with another), bar height, icon folder.
 - **Left:** the selected monitor's button list, grouped by edge — “left”,
   “center”, “right” sections.
 - **Right:** the selected button's fields — label, what to run, arguments, icon
@@ -89,6 +90,11 @@ visible.
   the **admin** / **console** / **separator** check boxes.
 - **Add** / **+ Separator** / **Delete** / **▲** / **▼** — change the set and
   order. **▲/▼** at a section edge move the entry into the neighbouring group.
+- **From taskbar…** (bottom-left) — bring programs pinned to the Windows taskbar in
+  as buttons on the current monitor: tick the ones you want in the dialog (Ctrl-click
+  for several). They stay pinned to the Windows taskbar too.
+- **Right-click a list entry** — **Copy** / **Paste**, or **Move to monitor** to send
+  the button straight to another screen without copying.
 - A separator takes its edge from where it sits — move it with **▲/▼** into the
   right section (its edge radio is disabled).
 - **OK** or **Apply** — write and redraw the panels at once (Apply keeps the
@@ -162,6 +168,12 @@ In `target` / `args` / `icon` you can use `%USERNAME%`, `%USERPROFILE%`,
 
 `monitor_1` is the leftmost monitor, `monitor_2` is to its right, and so on. Each
 has its own button set. On a single-monitor machine only `monitor_1` is used.
+
+**On the road / on a single screen.** To reach the `monitor_2` and `monitor_3`
+buttons when you only have one screen, open the editor and either press **⇄** to swap
+`monitor_1`'s set with the one you need, or pick another monitor at the top and drag
+individual buttons over with **right-click → Move to monitor → Monitor 1**. Nothing is
+destroyed — swap back the same way once the screens are back.
 
 ## Interface language
 

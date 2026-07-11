@@ -30,6 +30,7 @@
 #include <commdlg.h>               // GetOpenFileNameW for the config editor's file pickers
 #include <objbase.h>
 #include <shobjidl.h>              // IFileOpenDialog (folder picker for icon_dir)
+#include <shlobj.h>                // IShellLink + SHGetKnownFolderPath (taskbar import)
 #include <gdiplus.h>
 
 #include <string>
@@ -60,9 +61,9 @@ constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
 // Release metadata — shown in the About dialog and the editor title bar.
-constexpr wchar_t kVersion[]      = L"1.1.1";
+constexpr wchar_t kVersion[]      = L"1.2.0";
 constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
-constexpr wchar_t kReleaseDate[]  = L"2026-06-16";
+constexpr wchar_t kReleaseDate[]  = L"2026-07-11";
 constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
 
 constexpr UINT WM_APPBAR_CB       = WM_APP + 1;
@@ -107,6 +108,8 @@ constexpr int  IDC_BTN_ADDSEP     = 3022;
 constexpr int  IDC_MON_ADD        = 3023;
 constexpr int  IDC_MON_DEL        = 3024;
 constexpr int  IDC_ICONDIR_BROWSE = 3025;
+constexpr int  IDC_MON_SWAP       = 3026;   // swap current monitor's set with another
+constexpr int  IDC_BTN_IMPORT     = 3027;   // import pinned taskbar apps as buttons
 
 constexpr int  DEFAULT_HEIGHT_DIP = 48;
 constexpr int  MIN_HEIGHT_DIP     = 24;
@@ -743,9 +746,10 @@ enum Str {
     S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
     S_ED_MON_FMT, S_ED_GROUP_LEFT, S_ED_GROUP_CENTER, S_ED_GROUP_RIGHT,
     S_ED_ROW_UNNAMED, S_ED_FIELD_SEP, S_ED_PICKDIR,
-    S_ED_CTX_COPY, S_ED_CTX_PASTE,
+    S_ED_CTX_COPY, S_ED_CTX_PASTE, S_ED_CTX_MOVE,
+    S_ED_IMPORT, S_ED_IMPORT_TITLE, S_ED_IMPORT_LNK,
     S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
-    S_TIP_MONADD, S_TIP_MONDEL, S_TIP_ICONDIR,
+    S_TIP_MONADD, S_TIP_MONDEL, S_TIP_MONSWAP, S_TIP_IMPORT, S_TIP_ICONDIR,
     S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
     S_COUNT
 };
@@ -827,6 +831,11 @@ const StrDef kStrings[] = {
     { L"ed.pickdir",       L"Выберите папку с иконками", L"Choose the icon folder" },
     { L"ed.ctx.copy",      L"Копировать",               L"Copy" },
     { L"ed.ctx.paste",     L"Вставить",                 L"Paste" },
+    { L"ed.ctx.move",      L"Переместить на монитор",   L"Move to monitor" },
+    { L"ed.import",        L"Из панели задач…",         L"From taskbar…" },
+    { L"ed.import.title",  L"Выберите закреплённые в панели задач программы",
+                           L"Choose programs pinned to the taskbar" },
+    { L"ed.import.lnk",    L"Ярлыки (*.lnk)",           L"Shortcuts (*.lnk)" },
     { L"tip.edge",
       L"К какому краю полосы прижать кнопку: левый край, центр или правый. "
       L"Например: папки слева, программы справа.",
@@ -849,6 +858,12 @@ const StrDef kStrings[] = {
     { L"tip.monadd",       L"Добавить монитор (для экрана, который сейчас не подключён).",
                            L"Add a monitor (for a screen that is not connected right now)." },
     { L"tip.mondel",       L"Убрать последний монитор.", L"Remove the last monitor." },
+    { L"tip.monswap",      L"Поменять местами набор кнопок этого монитора с другим.",
+                           L"Swap this monitor's button set with another one." },
+    { L"tip.import",       L"Забрать закреплённые в панели задач Windows программы "
+                           L"кнопками на текущий монитор (в самой панели задач они останутся).",
+                           L"Bring programs pinned to the Windows taskbar in as buttons on the "
+                           L"current monitor (they stay pinned to the taskbar too)." },
     { L"tip.icondir",
       L"Папка, откуда берутся иконки по имени файла. По умолчанию «ico» — "
       L"подпапка рядом с panel.exe (так комплект остаётся переносимым). "
@@ -1131,7 +1146,8 @@ void EnsureInfoFile() {
         L"  файлов.\r\n"
         L"  Сверху: выбор монитора (кнопки + / − добавляют и убирают\r\n"
         L"          монитор — можно настроить экран, который сейчас не\r\n"
-        L"          подключён), высота полосы, папка иконок.\r\n"
+        L"          подключён; кнопка ⇄ меняет набор текущего монитора\r\n"
+        L"          местами с другим), высота полосы, папка иконок.\r\n"
         L"  Слева:  список кнопок выбранного монитора, СГРУППИРОВАННЫЙ по\r\n"
         L"          краю: секции «слева», «центр», «справа».\r\n"
         L"  Справа: поля выбранной кнопки — подпись, что запускать,\r\n"
@@ -1141,6 +1157,10 @@ void EnsureInfoFile() {
         L"  Кнопки Добавить / + Разделитель / Удалить / ▲ / ▼ —\r\n"
         L"          менять состав и порядок. ▲/▼ на краю секции переносят\r\n"
         L"          запись в соседнюю группу.\r\n"
+        L"  Из панели задач… (внизу слева) — забрать закреплённые в\r\n"
+        L"          панели задач Windows программы кнопками на этот монитор.\r\n"
+        L"  ПКМ по кнопке в списке — Копировать / Вставить или\r\n"
+        L"          Переместить на монитор (перенос на другой экран).\r\n"
         L"  Разделитель сам берёт край от того места, где стоит — двигай\r\n"
         L"  его ▲/▼ в нужную секцию (его переключатель края неактивен).\r\n"
         L"  OK или Применить — сразу записать и перерисовать панели\r\n"
@@ -1208,6 +1228,9 @@ void EnsureInfoFile() {
         L"  monitor_1 — самый левый монитор, monitor_2 — правее, и т.д.\r\n"
         L"  У каждого свой набор кнопок. На одномониторной машине\r\n"
         L"  используется только monitor_1.\r\n"
+        L"  В командировке (один экран): в редакторе кнопкой ⇄ поменяй\r\n"
+        L"  набор monitor_1 с нужным, или перенеси кнопки через ПКМ ->\r\n"
+        L"  Переместить на монитор. Настройки при этом не рушатся.\r\n"
         L"\r\n"
         L"ОБРАЗЕЦ\r\n"
         L"  ПКМ -> Образцовый набор запишет образцовый набор, где сразу\r\n"
@@ -1282,7 +1305,8 @@ void EnsureInfoFile() {
         L"  The window edits settings in place — no regedit or text files.\r\n"
         L"  Top:    monitor picker (the + / − buttons add and remove a\r\n"
         L"          monitor — you can set up a screen that is not\r\n"
-        L"          connected right now), bar height, icon folder.\r\n"
+        L"          connected right now; the ⇄ button swaps the current\r\n"
+        L"          monitor's button set with another), height, icons.\r\n"
         L"  Left:   the selected monitor's button list, GROUPED by edge:\r\n"
         L"          “left”, “center”, “right” sections.\r\n"
         L"  Right:  the selected button's fields — label, what to run,\r\n"
@@ -1292,6 +1316,10 @@ void EnsureInfoFile() {
         L"  The Add / + Separator / Delete / ▲ / ▼ buttons change the\r\n"
         L"          set and order. ▲/▼ at a section edge move the entry\r\n"
         L"          into the neighbouring group.\r\n"
+        L"  From taskbar… (bottom-left) — bring programs pinned to the\r\n"
+        L"          Windows taskbar in as buttons on this monitor.\r\n"
+        L"  Right-click a list entry — Copy / Paste or Move to monitor\r\n"
+        L"          (send the button straight to another screen).\r\n"
         L"  A separator takes its edge from where it sits — move it with\r\n"
         L"  ▲/▼ into the right section (its edge radio is disabled).\r\n"
         L"  OK or Apply — write and redraw the panels at once (Apply\r\n"
@@ -1360,6 +1388,9 @@ void EnsureInfoFile() {
         L"  monitor_1 — the leftmost monitor, monitor_2 — to its right,\r\n"
         L"  and so on. Each has its own button set. On a single-monitor\r\n"
         L"  machine only monitor_1 is used.\r\n"
+        L"  On the road (one screen): in the editor press ⇄ to swap\r\n"
+        L"  monitor_1's set with the one you need, or move buttons over\r\n"
+        L"  with right-click -> Move to monitor. Nothing is destroyed.\r\n"
         L"\r\n"
         L"SAMPLE\r\n"
         L"  Right-click -> Set default config writes a sample set that\r\n"
@@ -2140,9 +2171,10 @@ constexpr int IDC_LBL_MON=3200, IDC_LBL_H=3201, IDC_LBL_ICODIR=3202,
 const EdCtl kEd[] = {
     // top row — monitor picker + global height / icon dir
     { IDC_LBL_MON,       K_STATIC,  L"Монитор:",   12,  16,  54, 18 },
-    { IDC_MON_COMBO,     K_COMBO,   L"",           66,  12, 100, 200 },
-    { IDC_MON_ADD,       K_BTN,     L"+",         170,  12,  24, 23 },
-    { IDC_MON_DEL,       K_BTN,     L"−",         196,  12,  24, 23 },
+    { IDC_MON_COMBO,     K_COMBO,   L"",           66,  12,  90, 200 },
+    { IDC_MON_ADD,       K_BTN,     L"+",         158,  12,  22, 23 },
+    { IDC_MON_DEL,       K_BTN,     L"−",         182,  12,  22, 23 },
+    { IDC_MON_SWAP,      K_BTN,     L"⇄",         206,  12,  28, 23 },
     { IDC_LBL_H,         K_STATIC,  L"Высота:",   238,  16,  46, 18 },
     { IDC_HEIGHT_EDIT,   K_EDITNUM, L"",          286,  12,  44, 23 },
     { IDC_LBL_ICODIR,    K_STATIC,  L"Папка иконок:", 344, 16, 90, 18 },
@@ -2176,6 +2208,7 @@ const EdCtl kEd[] = {
     { IDC_CHK_CONSOLE,   K_CHECK,   L"Консоль (conhost)",          332, 246, 228, 20 },
     { IDC_CHK_SEP,       K_CHECK,   L"Разделитель (вместо кнопки)",332, 272, 228, 20 },
     // bottom — actions
+    { IDC_BTN_IMPORT,    K_BTN,     L"Из панели задач…", 12, 372, 220, 26, A_MOVEY },
     { IDOK,              K_DEFBTN,  L"OK",        322, 372,  78, 26, A_MOVEX | A_MOVEY },
     { IDCANCEL,          K_BTN,     L"Отмена",    408, 372,  78, 26, A_MOVEX | A_MOVEY },
     { IDC_APPLY,         K_BTN,     L"Применить", 494, 372,  78, 26, A_MOVEX | A_MOVEY },
@@ -2267,7 +2300,8 @@ void EditorApplyTexts(HWND hwnd) {
         { IDC_LBL_ALIGN, S_ED_EDGE }, { IDC_ALIGN_L, S_ED_LEFT },
         { IDC_ALIGN_C, S_ED_CENTER }, { IDC_ALIGN_R, S_ED_RIGHT },
         { IDC_CHK_ADMIN, S_ED_ADMIN }, { IDC_CHK_CONSOLE, S_ED_CONSOLE },
-        { IDC_CHK_SEP, S_ED_SEP }, { IDOK, S_COMMON_OK },
+        { IDC_CHK_SEP, S_ED_SEP }, { IDC_BTN_IMPORT, S_ED_IMPORT },
+        { IDOK, S_COMMON_OK },
         { IDCANCEL, S_COMMON_CANCEL }, { IDC_APPLY, S_COMMON_APPLY },
     };
     for (auto& m : map)
@@ -2531,6 +2565,8 @@ void EditorFillMonCombo(HWND hwnd, EditorState* st) {
         SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(buf));
     }
     SendMessageW(cb, CB_SETCURSEL, st->curMon, 0);
+    // Swapping needs at least two monitor sets to swap between.
+    EnableWindow(GetDlgItem(hwnd, IDC_MON_SWAP), st->mons.size() >= 2);
 }
 
 // ---- file pickers for target / icon ----
@@ -2611,6 +2647,117 @@ void EditorBrowseIconDir(HWND hwnd) {
     dlg->Release();
 }
 
+// ---- import pinned taskbar apps as buttons ----
+// Win32 apps pinned to the taskbar are plain .lnk files in this per-user folder.
+// (UWP/Store pins live only in the opaque Taskband registry blob and are skipped.)
+std::wstring TaskbarPinnedDir() {
+    wchar_t buf[MAX_PATH * 2] = L"";
+    DWORD n = ExpandEnvironmentStringsW(
+        L"%APPDATA%\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar",
+        buf, _countof(buf));
+    if (n == 0 || n > _countof(buf)) return std::wstring();
+    return std::wstring(buf);
+}
+
+// The pinned shortcut's file name (minus the trailing ".lnk") is its friendly label.
+std::wstring LnkStem(const std::wstring& path) {
+    std::wstring name = PathFindFileNameW(path.c_str());
+    size_t n = name.size();
+    if (n >= 4 && _wcsicmp(name.c_str() + n - 4, L".lnk") == 0) name.resize(n - 4);
+    return name;
+}
+
+// Resolve a .lnk into a launchable button (target exe + args). Icon is left empty
+// on purpose — the panel derives it from the resolved target, giving the app's own
+// icon. Returns false for shortcuts with no filesystem target (UWP/AppX links).
+bool ResolveLnkToButton(const std::wstring& lnkPath, ButtonCfg& out) {
+    IShellLinkW* link = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&link))) || !link)
+        return false;
+    bool ok = false;
+    IPersistFile* pf = nullptr;
+    if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&pf))) && pf) {
+        if (SUCCEEDED(pf->Load(lnkPath.c_str(), STGM_READ))) {
+            wchar_t target[MAX_PATH] = L"";
+            WIN32_FIND_DATAW fd{};
+            // SLGP_RAWPATH keeps %ProgramFiles% etc. unexpanded, matching how a
+            // person would type the target; the panel re-expands env vars at launch.
+            if (SUCCEEDED(link->GetPath(target, MAX_PATH, &fd, SLGP_RAWPATH)) && target[0]) {
+                out.target = target;
+                wchar_t args[1024] = L"";
+                if (SUCCEEDED(link->GetArguments(args, _countof(args)))) out.args = args;
+                ok = true;
+            }
+        }
+        pf->Release();
+    }
+    link->Release();
+    return ok;
+}
+
+// "From taskbar…" — multi-select the pinned .lnk files (dialog opens in their folder)
+// and add each resolved app as a button on the current monitor.
+void EditorImportFromTaskbar(HWND hwnd, EditorState* st) {
+    if (st->curMon < 0 || st->curMon >= static_cast<int>(st->mons.size())) return;
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(&dlg))) || !dlg)
+        return;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    COMDLG_FILTERSPEC filter[] = { { T(S_ED_IMPORT_LNK), L"*.lnk" } };
+    dlg->SetFileTypes(1, filter);
+    dlg->SetTitle(T(S_ED_IMPORT_TITLE));
+
+    std::wstring tb = TaskbarPinnedDir();
+    if (!tb.empty()) {
+        IShellItem* folder = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(tb.c_str(), nullptr, IID_PPV_ARGS(&folder))) && folder) {
+            dlg->SetFolder(folder);
+            folder->Release();
+        }
+    }
+
+    if (SUCCEEDED(dlg->Show(hwnd))) {
+        IShellItemArray* items = nullptr;
+        if (SUCCEEDED(dlg->GetResults(&items)) && items) {
+            DWORD count = 0;
+            items->GetCount(&count);
+            EditorFlushFields(hwnd, st);
+            auto& vec = st->mons[st->curMon];
+            BtnAlign dropAlign = EditorHasSel(st) ? vec[st->curBtn].align : BtnAlign::Left;
+            int added = 0;
+            for (DWORD i = 0; i < count; ++i) {
+                IShellItem* it = nullptr;
+                if (FAILED(items->GetItemAt(i, &it)) || !it) continue;
+                PWSTR path = nullptr;
+                if (SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &path)) && path) {
+                    ButtonCfg nb;
+                    if (ResolveLnkToButton(path, nb)) {
+                        nb.label = LnkStem(path);
+                        nb.align = dropAlign;
+                        vec.push_back(nb);
+                        ++added;
+                    }
+                    CoTaskMemFree(path);
+                }
+                it->Release();
+            }
+            items->Release();
+            if (added) {
+                EditorRegroup(vec);
+                st->curBtn = static_cast<int>(vec.size()) - 1;   // land on the last import
+                st->dirty = true;
+                EditorRefreshList(hwnd, st);
+                EditorLoadFields(hwnd, st);
+            }
+        }
+    }
+    dlg->Release();
+}
+
 // ---- explanatory tooltips on the less-obvious controls ----
 void EditorAddTip(HWND tip, HWND hwnd, int id, const wchar_t* text) {
     TOOLINFOW ti{ sizeof(ti) };
@@ -2643,6 +2790,8 @@ void EditorCreateTooltips(HWND hwnd, EditorState* st) {
     EditorAddTip(tip, hwnd, IDC_CHK_ADMIN,   T(S_TIP_ADMIN));
     EditorAddTip(tip, hwnd, IDC_MON_ADD,     T(S_TIP_MONADD));
     EditorAddTip(tip, hwnd, IDC_MON_DEL,     T(S_TIP_MONDEL));
+    EditorAddTip(tip, hwnd, IDC_MON_SWAP,    T(S_TIP_MONSWAP));
+    EditorAddTip(tip, hwnd, IDC_BTN_IMPORT,  T(S_TIP_IMPORT));
     const wchar_t* dirTip = T(S_TIP_ICONDIR);
     EditorAddTip(tip, hwnd, IDC_ICONDIR_EDIT,   dirTip);
     EditorAddTip(tip, hwnd, IDC_ICONDIR_BROWSE, dirTip);
@@ -2728,11 +2877,25 @@ void EditorListContextMenu(HWND hwnd, EditorState* st, int sx, int sy) {
         }
     }
 
-    constexpr UINT CTX_COPY = 1, CTX_PASTE = 2;
+    constexpr UINT CTX_COPY = 1, CTX_PASTE = 2, CTX_MOVE_BASE = 100;
     bool canCopy = EditorHasSel(st);
+    bool canMove = canCopy && st->mons.size() >= 2;   // needs another monitor to move to
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | (canCopy     ? 0u : MF_GRAYED), CTX_COPY,  T(S_ED_CTX_COPY));
     AppendMenuW(m, MF_STRING | (st->hasClip ? 0u : MF_GRAYED), CTX_PASTE, T(S_ED_CTX_PASTE));
+    if (canMove) {
+        // Direct move to another monitor's set — no copy/switch/paste dance.
+        HMENU sub = CreatePopupMenu();
+        for (size_t i = 0; i < st->mons.size(); ++i) {
+            if (static_cast<int>(i) == st->curMon) continue;
+            wchar_t buf[48];
+            _snwprintf_s(buf, _countof(buf), _TRUNCATE, T(S_ED_MON_FMT), static_cast<int>(i) + 1);
+            AppendMenuW(sub, MF_STRING, CTX_MOVE_BASE + i, buf);
+        }
+        AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), T(S_ED_CTX_MOVE));
+    } else {
+        AppendMenuW(m, MF_STRING | MF_GRAYED, 0, T(S_ED_CTX_MOVE));
+    }
 
     SetForegroundWindow(hwnd);
     UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
@@ -2754,6 +2917,21 @@ void EditorListContextMenu(HWND hwnd, EditorState* st, int sx, int sy) {
         st->dirty = true;
         EditorRefreshList(hwnd, st);
         EditorLoadFields(hwnd, st);
+    } else if (cmd >= CTX_MOVE_BASE && canMove && EditorHasSel(st)) {
+        int target = static_cast<int>(cmd) - CTX_MOVE_BASE;
+        if (target >= 0 && target < static_cast<int>(st->mons.size()) && target != st->curMon) {
+            EditorFlushFields(hwnd, st);
+            ButtonCfg moved = st->mons[st->curMon][st->curBtn];
+            auto& cur = st->mons[st->curMon];
+            cur.erase(cur.begin() + st->curBtn);       // pull from current monitor
+            st->mons[target].push_back(moved);         // drop onto the target's set
+            EditorRegroup(st->mons[target]);           // lands in its own edge group
+            if (cur.empty())                                     st->curBtn = -1;
+            else if (st->curBtn >= static_cast<int>(cur.size())) st->curBtn = static_cast<int>(cur.size()) - 1;
+            st->dirty = true;
+            EditorRefreshList(hwnd, st);
+            EditorLoadFields(hwnd, st);
+        }
     }
 }
 
@@ -2924,9 +3102,36 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                         }
                     }
                     break;
+                case IDC_MON_SWAP:
+                    if (st->mons.size() >= 2) {
+                        EditorFlushFields(hwnd, st);
+                        // Pop a list of the other monitors; pick one to swap with.
+                        HMENU m = CreatePopupMenu();
+                        for (size_t i = 0; i < st->mons.size(); ++i) {
+                            if (static_cast<int>(i) == st->curMon) continue;
+                            wchar_t buf[48];
+                            _snwprintf_s(buf, _countof(buf), _TRUNCATE,
+                                         T(S_ED_MON_FMT), static_cast<int>(i) + 1);
+                            AppendMenuW(m, MF_STRING, i + 1, buf);   // id = target+1 (1-based, 0 = cancel)
+                        }
+                        RECT rc{};
+                        GetWindowRect(GetDlgItem(hwnd, IDC_MON_SWAP), &rc);
+                        SetForegroundWindow(hwnd);
+                        UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON,
+                                                  rc.left, rc.bottom, 0, hwnd, nullptr);
+                        DestroyMenu(m);
+                        if (cmd >= 1 && cmd <= st->mons.size()) {
+                            int target = static_cast<int>(cmd) - 1;
+                            std::swap(st->mons[st->curMon], st->mons[target]);
+                            st->dirty = true;
+                            EditorRebuildMonState(hwnd, st);   // refresh list for the current slot
+                        }
+                    }
+                    break;
                 case IDC_TARGET_BROWSE:  EditorBrowseTarget(hwnd);  break;
                 case IDC_ICON_BROWSE:    EditorBrowseIcon(hwnd);    break;
                 case IDC_ICONDIR_BROWSE: EditorBrowseIconDir(hwnd); break;
+                case IDC_BTN_IMPORT:     EditorImportFromTaskbar(hwnd, st); break;
 
                 case IDOK:
                     EditorFlushFields(hwnd, st);
