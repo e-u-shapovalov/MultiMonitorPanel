@@ -61,9 +61,9 @@ constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
 // Release metadata — shown in the About dialog and the editor title bar.
-constexpr wchar_t kVersion[]      = L"1.2.0";
+constexpr wchar_t kVersion[]      = L"1.2.1";
 constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
-constexpr wchar_t kReleaseDate[]  = L"2026-07-11";
+constexpr wchar_t kReleaseDate[]  = L"2026-07-19";
 constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
 
 constexpr UINT WM_APPBAR_CB       = WM_APP + 1;
@@ -1883,12 +1883,69 @@ void PlaceProcessWindowOnMonitor(HANDLE hProcess, const RECT& monRect) {
     }
 }
 
+// --- placement for folder windows -----------------------------------
+// A folder target opens in the already-running desktop explorer.exe: ShellExecuteEx
+// returns no process handle and the new window belongs to that shared shell process,
+// so the PID-based move above can never reach it. Instead we snapshot the Explorer
+// windows that exist before the launch and, once a new one shows up, move it onto
+// the clicked monitor. Folder windows are the classic "CabinetWClass".
+BOOL CALLBACK CollectFolderWinProc(HWND hwnd, LPARAM lp) {
+    wchar_t cls[64];
+    if (GetClassNameW(hwnd, cls, 64) && wcscmp(cls, L"CabinetWClass") == 0)
+        reinterpret_cast<std::vector<HWND>*>(lp)->push_back(hwnd);
+    return TRUE;
+}
+
+std::vector<HWND> SnapshotFolderWindows() {
+    std::vector<HWND> v;
+    EnumWindows(CollectFolderWinProc, reinterpret_cast<LPARAM>(&v));
+    return v;
+}
+
+struct FolderPlaceCtx {
+    std::vector<HWND> before;   // Explorer windows that already existed before the launch
+    RECT              monRect{};
+};
+
+DWORD WINAPI FolderPlaceThreadProc(LPVOID param) {
+    std::unique_ptr<FolderPlaceCtx> ctx(reinterpret_cast<FolderPlaceCtx*>(param));
+
+    HWND target = nullptr;
+    for (int i = 0; i < 50 && !target; ++i) {        // poll up to ~5 s
+        for (HWND h : SnapshotFolderWindows()) {
+            if (IsWindowVisible(h) &&
+                std::find(ctx->before.begin(), ctx->before.end(), h) == ctx->before.end()) {
+                target = h;                          // a folder window that wasn't there before
+                break;
+            }
+        }
+        if (!target) Sleep(100);
+    }
+    // If no new window appeared (Explorer reused an existing one) we leave it alone.
+    if (target) CenterWindowOnMonitor(target, ctx->monRect);
+    return 0;
+}
+
+void PlaceNewFolderWindowOnMonitor(std::vector<HWND> before, const RECT& monRect) {
+    auto* ctx = new FolderPlaceCtx{ std::move(before), monRect };
+    HANDLE th = CreateThread(nullptr, 0, FolderPlaceThreadProc, ctx, 0, nullptr);
+    if (th) CloseHandle(th);
+    else    delete ctx;
+}
+
 // ---------------------------- click / menu ---------------------------
 void RunButton(PanelWindow* p, int idx) {
     if (idx < 0 || idx >= static_cast<int>(p->buttons.size())) return;
     if (p->buttons[idx].isSeparator) return;   // not launchable
 
     std::wstring target = ExpandEnv(p->buttons[idx].target);
+
+    // A folder opens in the shared desktop explorer.exe, which hands us no process
+    // handle — snapshot the Explorer windows now so we can spot the new one after the
+    // launch and move it onto this monitor (see PlaceNewFolderWindowOnMonitor).
+    bool isFolder = (PathIsDirectoryW(target.c_str()) != FALSE);
+    std::vector<HWND> foldersBefore;
+    if (isFolder) foldersBefore = SnapshotFolderWindows();
 
     // For shell: URIs (e.g. shell:AppsFolder\<AUMID>) there's no meaningful
     // parent directory — leaving lpDirectory=NULL lets the shell decide.
@@ -1928,11 +1985,17 @@ void RunButton(PanelWindow* p, int idx) {
     sei.lpDirectory  = workDir.empty() ? nullptr : workDir.c_str();
     sei.nShow        = SW_SHOWNORMAL;
 
-    if (ShellExecuteExW(&sei) && sei.hProcess) {
-        // Move the launched app onto this panel's monitor. Takes ownership of
-        // sei.hProcess. hProcess is NULL for shell:/UWP activations and for
-        // single-instance handoffs — those just open wherever they like.
-        PlaceProcessWindowOnMonitor(sei.hProcess, p->monRect);
+    if (ShellExecuteExW(&sei)) {
+        if (sei.hProcess) {
+            // Move the launched app onto this panel's monitor. Takes ownership of
+            // sei.hProcess. hProcess is NULL for shell:/UWP activations and for
+            // single-instance handoffs — those just open wherever they like.
+            PlaceProcessWindowOnMonitor(sei.hProcess, p->monRect);
+        } else if (isFolder) {
+            // Folder opened in the shared explorer.exe (no process handle): catch the
+            // newly created Explorer window and move it onto this panel's monitor.
+            PlaceNewFolderWindowOnMonitor(std::move(foldersBefore), p->monRect);
+        }
     }
 }
 
