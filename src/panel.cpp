@@ -237,6 +237,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     InitCommonControlsEx(&icc);
 
     g_hInst = hInst;
+    // Resolve the language before seeding so a fresh install on a non-Russian
+    // system gets English sample-button labels (DefaultButtons reads g_lang).
+    // LoadLanguage below still runs the full table load + external-file overlay.
+    g_lang = DetectLanguageCode();
     EnsureRegistryConfig();
     LoadGlobalCfg();
 
@@ -296,8 +300,14 @@ std::wstring GetExeDir() {
 std::wstring ExpandEnv(const std::wstring& s) {
     wchar_t buf[MAX_PATH * 4]{};
     DWORD n = ExpandEnvironmentStringsW(s.c_str(), buf, static_cast<DWORD>(_countof(buf)));
-    if (n == 0 || n > _countof(buf)) return s;
-    return std::wstring(buf);
+    if (n == 0) return s;
+    if (n <= _countof(buf)) return std::wstring(buf);
+    // Expansion overflowed the stack buffer — retry with an exactly-sized one
+    // (n counts the terminating NUL) so a long value isn't left unexpanded.
+    std::vector<wchar_t> big(n);
+    DWORD n2 = ExpandEnvironmentStringsW(s.c_str(), big.data(), n);
+    if (n2 == 0 || n2 > n) return s;
+    return std::wstring(big.data());
 }
 
 std::wstring TrimW(std::wstring s) {
@@ -751,6 +761,7 @@ enum Str {
     S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
     S_TIP_MONADD, S_TIP_MONDEL, S_TIP_MONSWAP, S_TIP_IMPORT, S_TIP_ICONDIR,
     S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
+    S_DLG_EXTRELOAD_TITLE, S_DLG_EXTRELOAD_BODY, S_DLG_EXTRELOAD_OK,
     S_COUNT
 };
 
@@ -876,6 +887,13 @@ const StrDef kStrings[] = {
     { L"filter.images",    L"Изображения (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)",
                            L"Images (*.png;*.ico;*.jpg;*.bmp;*.gif;*.tiff)" },
     { L"filter.all",       L"Все файлы (*.*)",          L"All files (*.*)" },
+    { L"dlg.extreload.title", L"Настройки изменены",    L"Settings changed" },
+    { L"dlg.extreload.body",
+      L"Настройки заменены через меню панели, а в этом окне открыт их прежний вид. "
+      L"Перечитать актуальные настройки? Несохранённые здесь правки будут потеряны.",
+      L"The settings were replaced from the panel menu, but this window still shows the "
+      L"previous version. Reload the current settings? Any unsaved changes here will be lost." },
+    { L"dlg.extreload.ok", L"Перечитать",               L"Reload" },
 };
 static_assert(_countof(kStrings) == S_COUNT, "kStrings out of sync with enum Str");
 
@@ -1509,7 +1527,12 @@ HICON LoadShellIcon(const std::wstring& pathRaw, int px) {
     if (SHGetFileInfoW(path.c_str(), 0, &sfi2, sizeof(sfi2), flags) && sfi2.hIcon)
         return sfi2.hIcon;
 
-    return LoadIconW(nullptr, IDI_APPLICATION);
+    // Every icon we hand back is DestroyIcon'd on teardown, so the shared system
+    // icon must be copied into an owned handle first (DestroyIcon on a shared icon
+    // is a documented no-op on modern Windows, but this keeps ownership honest).
+    HICON shared = LoadIconW(nullptr, IDI_APPLICATION);
+    HICON owned  = CopyIcon(shared);
+    return owned ? owned : shared;
 }
 
 // --------------------------- class registration ----------------------
@@ -1615,8 +1638,13 @@ void CreateAllPanels() {
                 p->hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(BTN_ID_BASE + static_cast<int>(k))),
                 g_hInst, nullptr);
-            if (btn && !p->buttons[k].isSeparator)
+            if (btn && !p->buttons[k].isSeparator) {
                 SetWindowSubclass(btn, BtnSubclassProc, 1, 0);
+                // Owner-draw ignores the window text visually, but it is the
+                // default MSAA/UIA accessible name — set it so a screen reader
+                // announces the button's label instead of an anonymous "Button".
+                SetWindowTextW(btn, p->buttons[k].label.c_str());
+            }
             p->btnHwnds.push_back(btn);
         }
 
@@ -1938,6 +1966,12 @@ void RunButton(PanelWindow* p, int idx) {
     if (idx < 0 || idx >= static_cast<int>(p->buttons.size())) return;
     if (p->buttons[idx].isSeparator) return;   // not launchable
 
+    // Snapshot the target monitor now: ShellExecuteExW below is synchronous and,
+    // for runas/UAC or DDE/COM activations, can pump this thread's message queue.
+    // A queued WM_MMP_REBUILD/WM_MMP_RELOAD would DestroyAllPanels and free *p,
+    // so we must not read p->monRect after the launch — use this copy instead.
+    RECT monRect = p->monRect;
+
     std::wstring target = ExpandEnv(p->buttons[idx].target);
 
     // A folder opens in the shared desktop explorer.exe, which hands us no process
@@ -1965,7 +1999,7 @@ void RunButton(PanelWindow* p, int idx) {
     // placement can't find it (the console opens on whatever monitor WT picks).
     // conhost.exe <cmd> forces a classic console window that IS in our tree, so
     // PlaceProcessWindowOnMonitor can move it onto the clicked panel's monitor.
-    if (p->buttons[idx].console && !isShellUri) {
+    if (p->buttons[idx].console && !isShellUri && !isFolder) {
         std::wstring inner = target;
         if (inner.find(L' ') != std::wstring::npos) inner = L"\"" + inner + L"\"";
         if (!args.empty()) inner += L" " + args;
@@ -1990,11 +2024,11 @@ void RunButton(PanelWindow* p, int idx) {
             // Move the launched app onto this panel's monitor. Takes ownership of
             // sei.hProcess. hProcess is NULL for shell:/UWP activations and for
             // single-instance handoffs — those just open wherever they like.
-            PlaceProcessWindowOnMonitor(sei.hProcess, p->monRect);
+            PlaceProcessWindowOnMonitor(sei.hProcess, monRect);
         } else if (isFolder) {
             // Folder opened in the shared explorer.exe (no process handle): catch the
             // newly created Explorer window and move it onto this panel's monitor.
-            PlaceNewFolderWindowOnMonitor(std::move(foldersBefore), p->monRect);
+            PlaceNewFolderWindowOnMonitor(std::move(foldersBefore), monRect);
         }
     }
 }
@@ -2520,9 +2554,14 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
     EdEnable(hwnd, IDC_ALIGN_R, has && !sep);
     EdEnable(hwnd, IDC_CHK_SEP,  has);
     EdEnable(hwnd, IDC_BTN_DEL,  has);
-    EdEnable(hwnd, IDC_BTN_UP,   has && st->curBtn > 0);
-    EdEnable(hwnd, IDC_BTN_DOWN, has &&
-             st->curBtn < static_cast<int>(st->mons[st->curMon].size()) - 1);
+    // ▲/▼ move within a group by swapping, or across a group boundary by shifting
+    // the edge one rank (EditorMoveSelection). So enable ▲ when there's a row above
+    // OR a leftward rank-shift is possible, and ▼ symmetrically — otherwise a
+    // separator (whose edge radios are read-only) can get stuck in an edge group.
+    BtnAlign selAlign = has ? st->mons[st->curMon][st->curBtn].align : BtnAlign::Left;
+    int selCount = has ? static_cast<int>(st->mons[st->curMon].size()) : 0;
+    EdEnable(hwnd, IDC_BTN_UP,   has && (st->curBtn > 0 || selAlign != BtnAlign::Left));
+    EdEnable(hwnd, IDC_BTN_DOWN, has && (st->curBtn < selCount - 1 || selAlign != BtnAlign::Right));
     st->loading = false;
 }
 
@@ -2811,7 +2850,12 @@ void EditorImportFromTaskbar(HWND hwnd, EditorState* st) {
             items->Release();
             if (added) {
                 EditorRegroup(vec);
-                st->curBtn = static_cast<int>(vec.size()) - 1;   // land on the last import
+                // Land on the last imported button. Imports go into dropAlign's
+                // group, so after regroup the last entry of *that* group is the
+                // final import — not vec.back() (which is the last Right button).
+                st->curBtn = -1;
+                for (int i = 0; i < static_cast<int>(vec.size()); ++i)
+                    if (vec[i].align == dropAlign) st->curBtn = i;
                 st->dirty = true;
                 EditorRefreshList(hwnd, st);
                 EditorLoadFields(hwnd, st);
@@ -3035,6 +3079,30 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 EditorRefreshList(hwnd, st);     // section headers + row placeholders
                 EditorLoadFields(hwnd, st);      // separator placeholder text
                 EditorCreateTooltips(hwnd, st);  // tips in the new language (recreated)
+            }
+            return 0;
+
+        case WM_MMP_RELOAD:
+            // The config was replaced from the panel menu (Set default / Erase) while
+            // this window is open. Re-sync our in-memory snapshot so a later OK/Apply
+            // won't clobber that action with our now-stale model. With unsaved edits,
+            // ask first — declining keeps the current model so the user can still Apply
+            // (or Cancel) it deliberately.
+            if (st) {
+                if (st->dirty &&
+                    !ConfirmDialog(hwnd, T(S_DLG_EXTRELOAD_TITLE), T(S_DLG_EXTRELOAD_BODY),
+                                   T(S_DLG_EXTRELOAD_OK), TD_WARNING_ICON))
+                    return 0;
+                st->loading = true;
+                EditorLoadModel(st);
+                st->curMon = 0;
+                st->curBtn = (st->mons.empty() || st->mons[0].empty()) ? -1 : 0;
+                EditorFillMonCombo(hwnd, st);
+                EdSetText(hwnd, IDC_HEIGHT_EDIT,  std::to_wstring(st->heightDip));
+                EdSetText(hwnd, IDC_ICONDIR_EDIT, st->iconDir);
+                EditorRefreshList(hwnd, st);
+                EditorLoadFields(hwnd, st);      // its tail resets st->loading = false
+                st->dirty = false;
             }
             return 0;
 
@@ -3403,6 +3471,8 @@ void ShowContextMenu(HWND hwnd) {
                     T(S_DLG_SETDEF_OK), TD_WARNING_ICON)) {
                 SetDefaultConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
+                // Re-sync an open editor so its stale snapshot can't overwrite this.
+                if (g_hEditor) SendMessageW(g_hEditor, WM_MMP_RELOAD, 0, 0);
             }
             break;
         case MENU_ERASE:
@@ -3410,6 +3480,7 @@ void ShowContextMenu(HWND hwnd) {
                     T(S_DLG_ERASE_OK), TD_WARNING_ICON)) {
                 EraseConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
+                if (g_hEditor) SendMessageW(g_hEditor, WM_MMP_RELOAD, 0, 0);
             }
             break;
         case MENU_FOLDER: {
@@ -3424,6 +3495,14 @@ void ShowContextMenu(HWND hwnd) {
             break;
         }
         case MENU_EXIT:
+            // Route through the editor's own dirty-guard so unsaved edits aren't
+            // dropped silently (IDCANCEL prompts when dirty, matching Cancel / the
+            // window's ✕). If the user declines to close, g_hEditor is still set —
+            // abort the exit and leave the editor open.
+            if (g_hEditor) {
+                SendMessageW(g_hEditor, WM_COMMAND, IDCANCEL, 0);
+                if (g_hEditor) break;
+            }
             PostMessageW(g_hCtrl, WM_CLOSE, 0, 0);
             break;
     }
@@ -3451,8 +3530,11 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
         case WM_DPICHANGED:
             if (p) {
-                p->dpi = HIWORD(w);
-                RepositionAppBar(p);
+                // The monitor's scale changed. RepositionAppBar alone would relayout
+                // the buttons but leave icons at the old pixel size (DrawIconEx then
+                // upscales them → blurry). Rebuild every panel so icons reload at each
+                // monitor's current DPI, honoring the manifest's PerMonitorV2 claim.
+                PostMessageW(g_hCtrl, WM_MMP_REBUILD, 0, 0);
             }
             return 0;
 
