@@ -39,6 +39,8 @@
 #include <algorithm>
 #include <utility>
 #include <cwchar>
+#include <mutex>
+#include <unordered_set>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -61,9 +63,9 @@ constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
 // Release metadata — shown in the About dialog and the editor title bar.
-constexpr wchar_t kVersion[]      = L"1.2.3";
+constexpr wchar_t kVersion[]      = L"1.3.1";
 constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
-constexpr wchar_t kReleaseDate[]  = L"2026-07-19";
+constexpr wchar_t kReleaseDate[]  = L"2026-07-20";
 constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
 
 constexpr UINT WM_APPBAR_CB       = WM_APP + 1;
@@ -110,6 +112,8 @@ constexpr int  IDC_MON_DEL        = 3024;
 constexpr int  IDC_ICONDIR_BROWSE = 3025;
 constexpr int  IDC_MON_SWAP       = 3026;   // swap current monitor's set with another
 constexpr int  IDC_BTN_IMPORT     = 3027;   // import pinned taskbar apps as buttons
+constexpr int  IDC_RUNMON_COMBO   = 3028;   // per-button "open on monitor" override
+constexpr int  IDC_CHK_MAXIMIZE   = 3029;   // maximize the window on the target monitor
 
 constexpr int  DEFAULT_HEIGHT_DIP = 48;
 constexpr int  MIN_HEIGHT_DIP     = 24;
@@ -142,6 +146,11 @@ struct ButtonCfg {
     BtnAlign     align       = BtnAlign::Left;
     bool         isSeparator = false;   // vertical divider, not a launchable button
     bool         console     = false;   // wrap launch in classic conhost (a movable window)
+    int          launchMon   = 0;       // which monitor to open the window on: 0 = the
+                                        // button's own panel monitor; N = force monitor N
+                                        // (1-based, left-to-right, same order as monitor_<N>)
+    bool         maximize    = false;   // after moving it onto the target monitor, maximize
+                                        // the window (full screen on that monitor)
 };
 
 struct GlobalCfg {
@@ -435,6 +444,7 @@ void ParseFlags(const std::wstring& flagsRaw, ButtonCfg& b) {
             else if (tok == L"left")                       b.align       = BtnAlign::Left;
             else if (tok == L"sep"    || tok == L"separator") b.isSeparator = true;
             else if (tok == L"console" || tok == L"conhost")  b.console     = true;
+            else if (tok == L"maximize" || tok == L"max")     b.maximize    = true;
         }
         if (e == std::wstring::npos) break;
         pos = e + 1;
@@ -451,6 +461,7 @@ std::wstring BuildFlags(const ButtonCfg& b) {
     if (b.align == BtnAlign::Right)  add(L"right");
     if (b.align == BtnAlign::Center) add(L"center");
     if (b.console)                   add(L"console");
+    if (b.maximize)                  add(L"maximize");
     if (b.runAsAdmin)                add(L"admin");
     return s;
 }
@@ -483,6 +494,9 @@ void WriteButton(HKEY root, int mon, int btn, const ButtonCfg& b) {
     RegWriteStr(k, L"args",   b.args);
     RegWriteStr(k, L"icon",   b.iconPath);
     RegWriteStr(k, L"flags",  BuildFlags(b));
+    // Per-button "open on monitor" override. Kept as its own value (not a flag
+    // token) since it's a number; empty/absent means "use the panel's monitor".
+    RegWriteStr(k, L"run_monitor", b.launchMon > 0 ? std::to_wstring(b.launchMon) : L"");
     RegCloseKey(k);
 }
 
@@ -723,6 +737,8 @@ std::vector<ButtonCfg> LoadButtonsForMonitor(int idx) {
         b.args     = RegReadStr(k, L"args");
         b.iconPath = RegReadStr(k, L"icon");
         ParseFlags(RegReadStr(k, L"flags"), b);
+        b.launchMon = _wtoi(RegReadStr(k, L"run_monitor").c_str());
+        if (b.launchMon < 0) b.launchMon = 0;
 
         RegCloseKey(k);
         // Separators carry no target — keep them; everything else needs one.
@@ -754,12 +770,14 @@ enum Str {
     S_ED_TITLE_SUFFIX, S_ED_MONITOR, S_ED_HEIGHT, S_ED_ICONS,
     S_ED_GRP_BUTTONS, S_ED_GRP_PROP, S_ED_LABEL, S_ED_TARGET, S_ED_ARGS,
     S_ED_ICON, S_ED_EDGE, S_ED_LEFT, S_ED_CENTER, S_ED_RIGHT,
-    S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
+    S_ED_ADMIN, S_ED_CONSOLE, S_ED_SEP, S_ED_MAXIMIZE, S_ED_RUNMON, S_ED_RUNMON_DEF,
+    S_ED_ADD, S_ED_ADDSEP, S_ED_DEL,
     S_ED_MON_FMT, S_ED_GROUP_LEFT, S_ED_GROUP_CENTER, S_ED_GROUP_RIGHT,
     S_ED_ROW_UNNAMED, S_ED_FIELD_SEP, S_ED_PICKDIR,
     S_ED_CTX_COPY, S_ED_CTX_PASTE, S_ED_CTX_MOVE,
     S_ED_IMPORT, S_ED_IMPORT_TITLE, S_ED_IMPORT_LNK,
-    S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_ADMIN,
+    S_TIP_EDGE, S_TIP_ADDSEP, S_TIP_SEP, S_TIP_CONSOLE, S_TIP_RUNMON, S_TIP_MAXIMIZE,
+    S_TIP_ADMIN,
     S_TIP_MONADD, S_TIP_MONDEL, S_TIP_MONSWAP, S_TIP_IMPORT, S_TIP_ICONDIR,
     S_FILTER_PROGRAMS, S_FILTER_IMAGES, S_FILTER_ALL,
     S_DLG_EXTRELOAD_TITLE, S_DLG_EXTRELOAD_BODY, S_DLG_EXTRELOAD_OK,
@@ -831,6 +849,9 @@ const StrDef kStrings[] = {
     { L"ed.admin",         L"От администратора (UAC)",   L"Run as administrator (UAC)" },
     { L"ed.console",       L"Консоль (conhost)",        L"Console (conhost)" },
     { L"ed.sep",           L"Разделитель (вместо кнопки)", L"Separator (instead of a button)" },
+    { L"ed.maximize",      L"Развернуть на весь экран", L"Maximize (full screen)" },
+    { L"ed.runmon",        L"Открыть на:",              L"Open on:" },
+    { L"ed.runmon.def",    L"как в панели",             L"same as the panel" },
     { L"ed.add",           L"Добавить",                 L"Add" },
     { L"ed.addsep",        L"+ Разделитель",            L"+ Separator" },
     { L"ed.del",           L"Удалить",                  L"Delete" },
@@ -865,6 +886,16 @@ const StrDef kStrings[] = {
       L"кнопка (через классический conhost).",
       L"For cmd / PowerShell and other consoles: open on the SAME monitor as the "
       L"button (via the classic conhost)." },
+    { L"tip.runmon",
+      L"На каком мониторе открыть окно программы. «как в панели» — на том, где "
+      L"стоит кнопка. Иначе — на выбранном мониторе (если он сейчас подключён).",
+      L"Which monitor to open the program's window on. “same as the panel” — the one "
+      L"the button sits on. Otherwise the chosen monitor (when it is connected)." },
+    { L"tip.maximize",
+      L"После переноса на нужный монитор развернуть окно на весь экран этого монитора. "
+      L"Работает там же, где вообще срабатывает перенос окна.",
+      L"After moving it onto the target monitor, maximize the window to fill that "
+      L"monitor. Works wherever the window move itself works." },
     { L"tip.admin",        L"Запустить от имени администратора (будет запрос UAC).",
                            L"Run as administrator (a UAC prompt will appear)." },
     { L"tip.monadd",       L"Добавить монитор (для экрана, который сейчас не подключён).",
@@ -1797,6 +1828,7 @@ struct PlaceCtx {
     DWORD  pid      = 0;
     HANDLE hProcess = nullptr;
     RECT   monRect  {};   // rcMonitor of the target monitor (copied by value)
+    bool   maximize = false;
 };
 
 struct PidWindowSearch { const std::vector<DWORD>* pids; HWND found; };
@@ -1846,7 +1878,11 @@ std::vector<DWORD> CollectProcessTree(DWORD rootPid) {
     return tree;
 }
 
-void CenterWindowOnMonitor(HWND hwnd, const RECT& monRect) {
+// Center hwnd in the work area of the monitor that monRect belongs to. If the
+// window was already maximized, or the button asks for it (maximize=true), leave
+// it maximized on that monitor: restore → move → (re)maximize so it fills the
+// TARGET screen and not wherever it first opened.
+void CenterWindowOnMonitor(HWND hwnd, const RECT& monRect, bool maximize) {
     HMONITOR hm = MonitorFromRect(&monRect, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(hm, &mi)) return;
@@ -1857,19 +1893,59 @@ void CenterWindowOnMonitor(HWND hwnd, const RECT& monRect) {
     WINDOWPLACEMENT wp{sizeof(wp)};
     GetWindowPlacement(hwnd, &wp);
     const bool wasMax = (wp.showCmd == SW_SHOWMAXIMIZED);
-    if (wasMax) ShowWindow(hwnd, SW_RESTORE);    // restore so the move takes effect...
+    const bool endMax = wasMax || maximize;
 
-    RECT r{};
-    GetWindowRect(hwnd, &r);
-    int w = r.right - r.left;
-    int h = r.bottom - r.top;
-    if (w > waw) w = waw;                         // never wider/taller than the work area
-    if (h > wah) h = wah;
-    const int x = wa.left + (waw - w) / 2;
-    const int y = wa.top  + (wah - h) / 2;
-    SetWindowPos(hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    if (endMax) {
+        // Maximize in a SINGLE SetWindowPlacement call: it sets the restore rect
+        // AND the maximized state at once, so the app gets one WM_SIZE instead of
+        // the two or three that restore→SetWindowPos→SW_SHOWMAXIMIZED produced —
+        // the extra resizes were what scrambled console TUIs. The monitor to
+        // maximize on is the one containing rcNormalPosition.
+        RECT r{};
+        GetWindowRect(hwnd, &r);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w > waw) w = waw;
+        if (h > wah) h = wah;
+        const int x = wa.left + (waw - w) / 2;
+        const int y = wa.top  + (wah - h) / 2;
+        // rcNormalPosition is in workspace coordinates; they differ from screen
+        // coordinates only when a taskbar/AppBar sits on the TOP or LEFT of the
+        // target monitor (ours are ABE_BOTTOM, so here they match). A residual
+        // offset in that rare case shifts only the *restore* size, never which
+        // monitor it maximizes on — so the maximize itself is always correct.
+        wp.showCmd          = SW_SHOWMAXIMIZED;
+        wp.flags            = 0;
+        wp.rcNormalPosition = { x, y, x + w, y + h };
+        SetWindowPlacement(hwnd, &wp);
+    } else {
+        // Plain move — keep the window's size (SWP_NOSIZE). Resizing sends the app
+        // a WM_SIZE, which corrupts a console/TUI that is already drawing; a pure
+        // move does not. Re-center by the current size within the work area.
+        RECT r{};
+        GetWindowRect(hwnd, &r);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        int x = wa.left + (waw - w) / 2;
+        int y = wa.top  + (wah - h) / 2;
+        if (x < wa.left) x = wa.left;            // keep the top-left on-screen if it's larger
+        if (y < wa.top)  y = wa.top;
+        SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
 
-    if (wasMax) ShowWindow(hwnd, SW_SHOWMAXIMIZED); // ...then re-maximize on this monitor
+// Guards two concurrent placement threads from grabbing the same window — e.g.
+// two console buttons clicked in quick succession, or the PID path and a
+// snapshot catcher both seeing the same descendant console HWND. First thread to
+// claim a window owns it; others skip it and keep scanning. Never cleared: a
+// claim must outlive both racing threads' poll windows, and a stale HWND that
+// Windows later recycles being skipped once is harmless (memory is a pointer per
+// launch). Single-click behaviour is unchanged (the one window claims fine).
+std::mutex               g_placeClaimMx;
+std::unordered_set<HWND> g_placeClaimed;
+bool TryClaimWindow(HWND h) {
+    std::lock_guard<std::mutex> lk(g_placeClaimMx);
+    return g_placeClaimed.insert(h).second;
 }
 
 DWORD WINAPI PlaceThreadProc(LPVOID param) {
@@ -1893,15 +1969,16 @@ DWORD WINAPI PlaceThreadProc(LPVOID param) {
     // One-shot move onto the target monitor. Apps that aggressively restore
     // their own saved position (e.g. Winbox) may override this — that's accepted
     // rather than fought with repeated nudging, which only makes windows jitter.
-    if (target) CenterWindowOnMonitor(target, ctx->monRect);
+    // TryClaimWindow guards against a concurrent catcher moving the same HWND.
+    if (target && TryClaimWindow(target)) CenterWindowOnMonitor(target, ctx->monRect, ctx->maximize);
 
     CloseHandle(ctx->hProcess);
     return 0;
 }
 
 // Takes ownership of hProcess (the worker thread closes it).
-void PlaceProcessWindowOnMonitor(HANDLE hProcess, const RECT& monRect) {
-    auto* ctx = new PlaceCtx{ GetProcessId(hProcess), hProcess, monRect };
+void PlaceProcessWindowOnMonitor(HANDLE hProcess, const RECT& monRect, bool maximize) {
+    auto* ctx = new PlaceCtx{ GetProcessId(hProcess), hProcess, monRect, maximize };
     HANDLE th = CreateThread(nullptr, 0, PlaceThreadProc, ctx, 0, nullptr);
     if (th) {
         CloseHandle(th);
@@ -1933,6 +2010,7 @@ std::vector<HWND> SnapshotFolderWindows() {
 struct FolderPlaceCtx {
     std::vector<HWND> before;   // Explorer windows that already existed before the launch
     RECT              monRect{};
+    bool              maximize = false;
 };
 
 DWORD WINAPI FolderPlaceThreadProc(LPVOID param) {
@@ -1941,22 +2019,93 @@ DWORD WINAPI FolderPlaceThreadProc(LPVOID param) {
     HWND target = nullptr;
     for (int i = 0; i < 50 && !target; ++i) {        // poll up to ~5 s
         for (HWND h : SnapshotFolderWindows()) {
-            if (IsWindowVisible(h) &&
-                std::find(ctx->before.begin(), ctx->before.end(), h) == ctx->before.end()) {
-                target = h;                          // a folder window that wasn't there before
-                break;
-            }
+            if (!IsWindowVisible(h)) continue;
+            if (std::find(ctx->before.begin(), ctx->before.end(), h) != ctx->before.end())
+                continue;                            // was already open
+            if (!TryClaimWindow(h)) continue;        // another placement thread took it
+            target = h;                              // a folder window that wasn't there before
+            break;
         }
         if (!target) Sleep(100);
     }
     // If no new window appeared (Explorer reused an existing one) we leave it alone.
-    if (target) CenterWindowOnMonitor(target, ctx->monRect);
+    if (target) CenterWindowOnMonitor(target, ctx->monRect, ctx->maximize);
     return 0;
 }
 
-void PlaceNewFolderWindowOnMonitor(std::vector<HWND> before, const RECT& monRect) {
-    auto* ctx = new FolderPlaceCtx{ std::move(before), monRect };
+void PlaceNewFolderWindowOnMonitor(std::vector<HWND> before, const RECT& monRect, bool maximize) {
+    auto* ctx = new FolderPlaceCtx{ std::move(before), monRect, maximize };
     HANDLE th = CreateThread(nullptr, 0, FolderPlaceThreadProc, ctx, 0, nullptr);
+    if (th) CloseHandle(th);
+    else    delete ctx;
+}
+
+// --- placement for console / terminal windows -----------------------
+// A console launch can put its *real* window out of our process tree, where the
+// PID walk in PlaceThreadProc can't reach it: a batch that re-spawns itself via
+// `start "…" cmd /k …` leaves the visible window on a detached PID (its parent
+// exits immediately), and Windows Terminal (`wt …`) hosts its window in
+// WindowsTerminal.exe. So, exactly like folders, snapshot the console/terminal
+// windows before the launch and move the first genuinely new one onto the
+// clicked monitor. Classes: classic conhost console = "ConsoleWindowClass";
+// Windows Terminal = "CASCADIA_HOSTING_WINDOW_CLASS".
+// The one window we must ignore is our own conhost wrapper (see the `console`
+// flag in RunButton): it is a new ConsoleWindowClass window too, but it belongs
+// to the process we launched (excludePid) and the PID path already handles it —
+// grabbing it here would move a window that closes a moment later.
+bool IsConsoleClassWindow(HWND hwnd) {
+    wchar_t cls[64];
+    if (!GetClassNameW(hwnd, cls, 64)) return false;
+    return wcscmp(cls, L"ConsoleWindowClass") == 0 ||
+           wcscmp(cls, L"CASCADIA_HOSTING_WINDOW_CLASS") == 0;
+}
+
+BOOL CALLBACK CollectConsoleWinProc(HWND hwnd, LPARAM lp) {
+    if (IsConsoleClassWindow(hwnd))
+        reinterpret_cast<std::vector<HWND>*>(lp)->push_back(hwnd);
+    return TRUE;
+}
+
+std::vector<HWND> SnapshotConsoleWindows() {
+    std::vector<HWND> v;
+    EnumWindows(CollectConsoleWinProc, reinterpret_cast<LPARAM>(&v));
+    return v;
+}
+
+struct ConsolePlaceCtx {
+    std::vector<HWND> before;      // console/terminal windows already open before the launch
+    RECT              monRect{};
+    DWORD             excludePid = 0;   // our own conhost wrapper — leave it to the PID path
+    bool              maximize = false;
+};
+
+DWORD WINAPI ConsolePlaceThreadProc(LPVOID param) {
+    std::unique_ptr<ConsolePlaceCtx> ctx(reinterpret_cast<ConsolePlaceCtx*>(param));
+
+    HWND target = nullptr;
+    for (int i = 0; i < 60 && !target; ++i) {        // poll up to ~6 s
+        for (HWND h : SnapshotConsoleWindows()) {
+            if (!IsWindowVisible(h)) continue;
+            if (std::find(ctx->before.begin(), ctx->before.end(), h) != ctx->before.end())
+                continue;                            // was already open
+            DWORD wpid = 0;
+            GetWindowThreadProcessId(h, &wpid);
+            if (wpid == ctx->excludePid) continue;   // our transient conhost wrapper
+            if (!TryClaimWindow(h)) continue;        // another placement thread took it
+            target = h;                              // a new, unrelated console/terminal window
+            break;
+        }
+        if (!target) Sleep(100);
+    }
+    // No new window (e.g. `wt -w 0` reused an existing Terminal window) → leave it alone.
+    if (target) CenterWindowOnMonitor(target, ctx->monRect, ctx->maximize);
+    return 0;
+}
+
+void PlaceNewConsoleWindowOnMonitor(std::vector<HWND> before, const RECT& monRect,
+                                    DWORD excludePid, bool maximize) {
+    auto* ctx = new ConsolePlaceCtx{ std::move(before), monRect, excludePid, maximize };
+    HANDLE th = CreateThread(nullptr, 0, ConsolePlaceThreadProc, ctx, 0, nullptr);
     if (th) CloseHandle(th);
     else    delete ctx;
 }
@@ -1971,6 +2120,20 @@ void RunButton(PanelWindow* p, int idx) {
     // A queued WM_MMP_REBUILD/WM_MMP_RELOAD would DestroyAllPanels and free *p,
     // so we must not read p->monRect after the launch — use this copy instead.
     RECT monRect = p->monRect;
+    HMONITOR targetMon = p->hMonitor;                 // read now, while *p is alive
+    const bool maximize = p->buttons[idx].maximize;
+
+    // Per-button monitor override: open the window on a specific screen instead of
+    // this button's own panel monitor. Monitor N is the Nth left-to-right (same
+    // order as monitor_<N> in the config). An override pointing at a screen that
+    // isn't connected right now silently falls back to this panel's monitor.
+    if (int launchMon = p->buttons[idx].launchMon; launchMon > 0) {
+        auto mons = EnumMonitorsLR();
+        if (launchMon <= static_cast<int>(mons.size())) {
+            monRect   = mons[launchMon - 1].rc;
+            targetMon = mons[launchMon - 1].h;
+        }
+    }
 
     std::wstring target = ExpandEnv(p->buttons[idx].target);
 
@@ -1999,7 +2162,8 @@ void RunButton(PanelWindow* p, int idx) {
     // placement can't find it (the console opens on whatever monitor WT picks).
     // conhost.exe <cmd> forces a classic console window that IS in our tree, so
     // PlaceProcessWindowOnMonitor can move it onto the clicked panel's monitor.
-    if (p->buttons[idx].console && !isShellUri && !isFolder) {
+    bool isConsole = p->buttons[idx].console && !isShellUri && !isFolder;
+    if (isConsole) {
         std::wstring inner = target;
         if (inner.find(L' ') != std::wstring::npos) inner = L"\"" + inner + L"\"";
         if (!args.empty()) inner += L" " + args;
@@ -2007,12 +2171,25 @@ void RunButton(PanelWindow* p, int idx) {
         args   = inner;
     }
 
+    // A console command whose real window ends up detached or Windows-Terminal-hosted
+    // (e.g. a batch that re-spawns via `start … cmd /k`, or `wt …` tabs) is out of our
+    // process tree — the PID move below can't reach it. Snapshot the console/terminal
+    // windows now so PlaceNewConsoleWindowOnMonitor can catch the new one and move it.
+    std::vector<HWND> consoleBefore;
+    if (isConsole) consoleBefore = SnapshotConsoleWindows();
+
     SHELLEXECUTEINFOW sei{sizeof(sei)};
     // No SEE_MASK_ASYNCOK: it makes ShellExecuteEx return BEFORE hProcess is
     // filled in, so we'd never get a handle and the per-monitor move below would
     // never run. Synchronous launch populates hProcess.
-    sei.fMask        = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS;
+    // SEE_MASK_HMONITOR hints the shell to open the window on the target monitor
+    // up front (best-effort — apps that restore their own saved position ignore
+    // it), so it lands right before the mover thread has to nudge it, and so the
+    // hint matches the per-button "open on monitor" override. hMonitor shares a
+    // union with hIcon, which we don't use.
+    sei.fMask        = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_HMONITOR;
     sei.hwnd         = p->hwnd;
+    sei.hMonitor     = targetMon;
     sei.lpVerb       = p->buttons[idx].runAsAdmin ? L"runas" : nullptr;
     sei.lpFile       = target.c_str();
     sei.lpParameters = args.empty()   ? nullptr : args.c_str();
@@ -2024,11 +2201,18 @@ void RunButton(PanelWindow* p, int idx) {
             // Move the launched app onto this panel's monitor. Takes ownership of
             // sei.hProcess. hProcess is NULL for shell:/UWP activations and for
             // single-instance handoffs — those just open wherever they like.
-            PlaceProcessWindowOnMonitor(sei.hProcess, monRect);
+            DWORD launchedPid = GetProcessId(sei.hProcess);
+            PlaceProcessWindowOnMonitor(sei.hProcess, monRect, maximize);
+            // For a console launch, ALSO watch for a new console/terminal window that
+            // opens outside our process tree (detached `start …` window, `wt …` tab in
+            // a fresh Terminal window). Excludes our own conhost wrapper (launchedPid),
+            // which the PID move above already handles.
+            if (isConsole)
+                PlaceNewConsoleWindowOnMonitor(std::move(consoleBefore), monRect, launchedPid, maximize);
         } else if (isFolder) {
             // Folder opened in the shared explorer.exe (no process handle): catch the
             // newly created Explorer window and move it onto this panel's monitor.
-            PlaceNewFolderWindowOnMonitor(std::move(foldersBefore), monRect);
+            PlaceNewFolderWindowOnMonitor(std::move(foldersBefore), monRect, maximize);
         }
     }
 }
@@ -2268,7 +2452,7 @@ struct EdCtl { int id; EdKind kind; const wchar_t* text; int x, y, w, h; int anc
 constexpr int IDC_LBL_MON=3200, IDC_LBL_H=3201, IDC_LBL_ICODIR=3202,
               IDC_GRP_BTN=3203, IDC_GRP_PROP=3204, IDC_LBL_LABEL=3205,
               IDC_LBL_TARGET=3206, IDC_LBL_ARGS=3207, IDC_LBL_ICON=3208,
-              IDC_LBL_ALIGN=3209;
+              IDC_LBL_ALIGN=3209, IDC_LBL_RUNMON=3210;
 
 const EdCtl kEd[] = {
     // top row — monitor picker + global height / icon dir
@@ -2309,6 +2493,9 @@ const EdCtl kEd[] = {
     { IDC_CHK_ADMIN,     K_CHECKG,  L"От администратора (UAC)",    332, 220, 228, 20 },
     { IDC_CHK_CONSOLE,   K_CHECK,   L"Консоль (conhost)",          332, 246, 228, 20 },
     { IDC_CHK_SEP,       K_CHECK,   L"Разделитель (вместо кнопки)",332, 272, 228, 20 },
+    { IDC_CHK_MAXIMIZE,  K_CHECK,   L"Развернуть на весь экран",  332, 298, 228, 20 },
+    { IDC_LBL_RUNMON,    K_STATIC,  L"Открыть на:", 286, 328,  80, 18 },
+    { IDC_RUNMON_COMBO,  K_COMBO,   L"",            372, 324, 188, 200, A_WSTRETCH },
     // bottom — actions
     { IDC_BTN_IMPORT,    K_BTN,     L"Из панели задач…", 12, 372, 220, 26, A_MOVEY },
     { IDOK,              K_DEFBTN,  L"OK",        322, 372,  78, 26, A_MOVEX | A_MOVEY },
@@ -2402,7 +2589,8 @@ void EditorApplyTexts(HWND hwnd) {
         { IDC_LBL_ALIGN, S_ED_EDGE }, { IDC_ALIGN_L, S_ED_LEFT },
         { IDC_ALIGN_C, S_ED_CENTER }, { IDC_ALIGN_R, S_ED_RIGHT },
         { IDC_CHK_ADMIN, S_ED_ADMIN }, { IDC_CHK_CONSOLE, S_ED_CONSOLE },
-        { IDC_CHK_SEP, S_ED_SEP }, { IDC_BTN_IMPORT, S_ED_IMPORT },
+        { IDC_CHK_SEP, S_ED_SEP }, { IDC_CHK_MAXIMIZE, S_ED_MAXIMIZE },
+        { IDC_LBL_RUNMON, S_ED_RUNMON }, { IDC_BTN_IMPORT, S_ED_IMPORT },
         { IDOK, S_COMMON_OK },
         { IDCANCEL, S_COMMON_CANCEL }, { IDC_APPLY, S_COMMON_APPLY },
     };
@@ -2478,6 +2666,8 @@ void EditorSaveModel(EditorState* st) {
                 ButtonCfg sepCfg = b;
                 sepCfg.runAsAdmin = false;
                 sepCfg.console    = false;
+                sepCfg.launchMon  = 0;
+                sepCfg.maximize   = false;
                 WriteButton(root, static_cast<int>(mon + 1), ++btnNo, sepCfg);
             } else {
                 WriteButton(root, static_cast<int>(mon + 1), ++btnNo, b);
@@ -2506,8 +2696,31 @@ void EditorFlushFields(HWND hwnd, EditorState* st) {
     b.iconPath   = EdGetText(hwnd, IDC_ICON_EDIT);
     b.runAsAdmin = EdChecked(hwnd, IDC_CHK_ADMIN);
     b.console    = EdChecked(hwnd, IDC_CHK_CONSOLE);
+    b.maximize   = EdChecked(hwnd, IDC_CHK_MAXIMIZE);
     b.align = EdChecked(hwnd, IDC_ALIGN_R) ? BtnAlign::Right
             : EdChecked(hwnd, IDC_ALIGN_C) ? BtnAlign::Center : BtnAlign::Left;
+    // Combo item 0 = "same as the panel" (override off); items 1..N pick monitor N.
+    int rm = static_cast<int>(SendMessageW(GetDlgItem(hwnd, IDC_RUNMON_COMBO), CB_GETCURSEL, 0, 0));
+    b.launchMon = rm > 0 ? rm : 0;
+}
+
+// Fill the per-button "open on monitor" combo: item 0 = "same as the panel"
+// (the default) followed by one item per monitor in the model, then select the
+// button's current override. Driven from EditorLoadFields, so it also refreshes
+// after a monitor is added/removed and re-translates on a language switch.
+std::wstring FormatMonitorLabel(int n);   // defined below, next to the top monitor combo
+void EditorFillRunMonCombo(HWND hwnd, EditorState* st, const ButtonCfg* b) {
+    HWND cb = GetDlgItem(hwnd, IDC_RUNMON_COMBO);
+    if (!cb) return;
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(T(S_ED_RUNMON_DEF)));
+    for (size_t i = 0; i < st->mons.size(); ++i) {
+        std::wstring lbl = FormatMonitorLabel(static_cast<int>(i) + 1);
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(lbl.c_str()));
+    }
+    int sel = (b && b->launchMon > 0 && b->launchMon <= static_cast<int>(st->mons.size()))
+              ? b->launchMon : 0;
+    SendMessageW(cb, CB_SETCURSEL, sel, 0);
 }
 
 void EditorLoadFields(HWND hwnd, EditorState* st) {
@@ -2519,9 +2732,10 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
         EdSetText(hwnd, IDC_TARGET_EDIT, L"");
         EdSetText(hwnd, IDC_ARGS_EDIT,   L"");
         EdSetText(hwnd, IDC_ICON_EDIT,   L"");
-        EdCheck(hwnd, IDC_CHK_ADMIN,   false);
-        EdCheck(hwnd, IDC_CHK_CONSOLE, false);
-        EdCheck(hwnd, IDC_CHK_SEP,     false);
+        EdCheck(hwnd, IDC_CHK_ADMIN,    false);
+        EdCheck(hwnd, IDC_CHK_CONSOLE,  false);
+        EdCheck(hwnd, IDC_CHK_MAXIMIZE, false);
+        EdCheck(hwnd, IDC_CHK_SEP,      false);
         EdCheck(hwnd, IDC_ALIGN_L, true);
         EdCheck(hwnd, IDC_ALIGN_C, false);
         EdCheck(hwnd, IDC_ALIGN_R, false);
@@ -2532,9 +2746,10 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
         EdSetText(hwnd, IDC_TARGET_EDIT, L"");
         EdSetText(hwnd, IDC_ARGS_EDIT,   L"");
         EdSetText(hwnd, IDC_ICON_EDIT,   L"");
-        EdCheck(hwnd, IDC_CHK_ADMIN,   false);
-        EdCheck(hwnd, IDC_CHK_CONSOLE, false);
-        EdCheck(hwnd, IDC_CHK_SEP,     true);
+        EdCheck(hwnd, IDC_CHK_ADMIN,    false);
+        EdCheck(hwnd, IDC_CHK_CONSOLE,  false);
+        EdCheck(hwnd, IDC_CHK_MAXIMIZE, false);
+        EdCheck(hwnd, IDC_CHK_SEP,      true);
         const ButtonCfg& b = st->mons[st->curMon][st->curBtn];
         EdCheck(hwnd, IDC_ALIGN_L, b.align == BtnAlign::Left);
         EdCheck(hwnd, IDC_ALIGN_C, b.align == BtnAlign::Center);
@@ -2545,15 +2760,20 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
         EdSetText(hwnd, IDC_TARGET_EDIT, b.target);
         EdSetText(hwnd, IDC_ARGS_EDIT,   b.args);
         EdSetText(hwnd, IDC_ICON_EDIT,   b.iconPath);
-        EdCheck(hwnd, IDC_CHK_ADMIN,   b.runAsAdmin);
-        EdCheck(hwnd, IDC_CHK_CONSOLE, b.console);
-        EdCheck(hwnd, IDC_CHK_SEP,     false);
+        EdCheck(hwnd, IDC_CHK_ADMIN,    b.runAsAdmin);
+        EdCheck(hwnd, IDC_CHK_CONSOLE,  b.console);
+        EdCheck(hwnd, IDC_CHK_MAXIMIZE, b.maximize);
+        EdCheck(hwnd, IDC_CHK_SEP,      false);
         EdCheck(hwnd, IDC_ALIGN_L, b.align == BtnAlign::Left);
         EdCheck(hwnd, IDC_ALIGN_C, b.align == BtnAlign::Center);
         EdCheck(hwnd, IDC_ALIGN_R, b.align == BtnAlign::Right);
     }
+    // "Open on monitor" applies to real buttons only; separators don't launch.
+    const ButtonCfg* selB = (has && !sep) ? &st->mons[st->curMon][st->curBtn] : nullptr;
+    EditorFillRunMonCombo(hwnd, st, selB);
     // label/target/args/icon/admin/console apply only to real buttons; a
     // separator only carries an alignment block + the separator toggle itself.
+    EdEnable(hwnd, IDC_RUNMON_COMBO,  has && !sep);
     EdEnable(hwnd, IDC_LABEL_EDIT,    has && !sep);
     EdEnable(hwnd, IDC_TARGET_EDIT,   has && !sep);
     EdEnable(hwnd, IDC_TARGET_BROWSE, has && !sep);
@@ -2562,6 +2782,7 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
     EdEnable(hwnd, IDC_ICON_BROWSE,   has && !sep);
     EdEnable(hwnd, IDC_CHK_ADMIN,     has && !sep);
     EdEnable(hwnd, IDC_CHK_CONSOLE,   has && !sep);
+    EdEnable(hwnd, IDC_CHK_MAXIMIZE,  has && !sep);
     // A separator's edge is determined by which group it sits in (move it with
     // ▲/▼), so its edge radios are read-only — they just show the inherited group.
     EdEnable(hwnd, IDC_ALIGN_L, has && !sep);
@@ -2924,6 +3145,10 @@ void EditorCreateTooltips(HWND hwnd, EditorState* st) {
     EditorAddTip(tip, hwnd, IDC_CHK_SEP,     T(S_TIP_SEP));
     EditorAddTip(tip, hwnd, IDC_CHK_CONSOLE, T(S_TIP_CONSOLE));
     EditorAddTip(tip, hwnd, IDC_CHK_ADMIN,   T(S_TIP_ADMIN));
+    EditorAddTip(tip, hwnd, IDC_CHK_MAXIMIZE, T(S_TIP_MAXIMIZE));
+    const wchar_t* runmonTip = T(S_TIP_RUNMON);
+    EditorAddTip(tip, hwnd, IDC_LBL_RUNMON,   runmonTip);
+    EditorAddTip(tip, hwnd, IDC_RUNMON_COMBO, runmonTip);
     EditorAddTip(tip, hwnd, IDC_MON_ADD,     T(S_TIP_MONADD));
     EditorAddTip(tip, hwnd, IDC_MON_DEL,     T(S_TIP_MONDEL));
     EditorAddTip(tip, hwnd, IDC_MON_SWAP,    T(S_TIP_MONSWAP));
@@ -3192,9 +3417,15 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                         EditorLoadFields(hwnd, st);
                     }
                     break;
-                case IDC_CHK_ADMIN: case IDC_CHK_CONSOLE:
+                case IDC_CHK_ADMIN: case IDC_CHK_CONSOLE: case IDC_CHK_MAXIMIZE:
                     if (code == BN_CLICKED && !st->loading) {
                         EditorFlushFields(hwnd, st);
+                        st->dirty = true;
+                    }
+                    break;
+                case IDC_RUNMON_COMBO:
+                    if (code == CBN_SELCHANGE && !st->loading) {
+                        EditorFlushFields(hwnd, st);   // read the new "open on monitor"
                         st->dirty = true;
                     }
                     break;
