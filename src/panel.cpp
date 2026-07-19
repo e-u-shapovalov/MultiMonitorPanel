@@ -171,6 +171,7 @@ GlobalCfg     g_global;
 std::vector<std::unique_ptr<PanelWindow>> g_panels;
 HANDLE        g_mutex   = nullptr;
 std::wstring  g_lang    = L"ru";     // active UI language code (see localization)
+bool          g_rebuildPending = false;   // a panel rebuild is queued — coalesce DPI/display bursts
 } // namespace
 
 // -------------------------- forward declarations ---------------------
@@ -244,10 +245,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     EnsureRegistryConfig();
     LoadGlobalCfg();
 
-    // Localization: write the editable lang templates, then load the chosen
-    // language (registry value "language", else auto-detected on first run).
+    // Localization: write the editable lang templates, then load the language
+    // already resolved into g_lang above (registry value / first-run auto-detect).
     EnsureLangFiles();
-    LoadLanguage(DetectLanguageCode());
+    LoadLanguage(g_lang);
 
     // Auto-create the icon directory so `icon_dir = ico` works out of the box
     // on a fresh unpack, even before the user drops any PNGs inside.
@@ -1527,12 +1528,11 @@ HICON LoadShellIcon(const std::wstring& pathRaw, int px) {
     if (SHGetFileInfoW(path.c_str(), 0, &sfi2, sizeof(sfi2), flags) && sfi2.hIcon)
         return sfi2.hIcon;
 
-    // Every icon we hand back is DestroyIcon'd on teardown, so the shared system
-    // icon must be copied into an owned handle first (DestroyIcon on a shared icon
-    // is a documented no-op on modern Windows, but this keeps ownership honest).
-    HICON shared = LoadIconW(nullptr, IDI_APPLICATION);
-    HICON owned  = CopyIcon(shared);
-    return owned ? owned : shared;
+    // Every icon we hand back is DestroyIcon'd on teardown, so return an OWNED copy
+    // of the shared system icon rather than the shared handle itself. CopyIcon can
+    // fail under resource pressure → null, which the caller stores as an empty slot
+    // (DrawIconEx draws nothing, DestroyIcon skips null) — never a shared handle.
+    return CopyIcon(LoadIconW(nullptr, IDI_APPLICATION));
 }
 
 // --------------------------- class registration ----------------------
@@ -1623,7 +1623,7 @@ void CreateAllPanels() {
             HICON h = nullptr;
             if (!b.iconPath.empty()) h = LoadFileIcon(b.iconPath, iconPx);
             if (!h) h = LoadShellIcon(b.target, iconPx);
-            p->icons.push_back(h ? h : LoadIconW(nullptr, IDI_APPLICATION));
+            p->icons.push_back(h);   // owned icon, or null (empty slot) — never a shared handle
         }
 
         // Create owner-drawn buttons. Separators are also BUTTON controls but
@@ -2148,7 +2148,11 @@ bool ConfirmDialog(HWND hwnd, PCWSTR mainInstr, PCWSTR content,
     cfg.nDefaultButton     = IDCANCEL;
     int pressed = 0;
     if (FAILED(TaskDialogIndirect(&cfg, &pressed, nullptr, nullptr)))
-        return MessageBoxW(hwnd, content, kAppTitle, MB_YESNO) == IDYES;
+        // MB_DEFBUTTON2 preserves the safe default of the TaskDialog path (Cancel) —
+        // without it MessageBox defaults to Yes, which would confirm a destructive
+        // action (Erase / Set default / close-dirty) on a stray Enter.
+        return MessageBoxW(hwnd, content, kAppTitle,
+                           MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES;
     return pressed == IDOK;
 }
 
@@ -2199,6 +2203,7 @@ struct EditorState {
     HWND  tip     = nullptr;                        // tooltip control (recreated on language change)
     bool  loading = false;                        // guard: silence EN_CHANGE/clicks while filling fields
     bool  dirty   = false;
+    bool  modalBusy = false;                       // a TaskDialog is up — block reentrant panel-menu commands
     std::vector<int> rowMap;                       // listbox row → model index (-1 = section header)
     ButtonCfg clip;                                // copy/paste buffer for the list context menu
     bool      hasClip = false;                     // is clip populated yet?
@@ -2452,6 +2457,16 @@ void EditorSaveModel(EditorState* st) {
     WriteGlobal(root, st->heightDip, st->iconDir);
     WriteLanguageValue(root);           // keep the language; RegDeleteTree wiped it
     for (size_t mon = 0; mon < st->mons.size(); ++mon) {
+        // Ensure the monitor key exists even with no buttons, so a slot added via
+        // "+ Monitor" (to pre-configure a screen not connected yet) survives the save —
+        // EditorLoadModel counts monitors by the highest monitor_<k> key present.
+        {
+            wchar_t mk[32];
+            _snwprintf_s(mk, _countof(mk), _TRUNCATE, L"monitor_%d", static_cast<int>(mon) + 1);
+            HKEY mkey = nullptr;
+            if (RegCreateKeyExW(root, mk, 0, nullptr, 0, KEY_WRITE, nullptr, &mkey, nullptr) == ERROR_SUCCESS)
+                RegCloseKey(mkey);
+        }
         int btnNo = 0;
         for (const ButtonCfg& b : st->mons[mon]) {
             if (b.target.empty() && !b.isSeparator) continue;   // drop blank rows
@@ -2569,7 +2584,9 @@ void EditorLoadFields(HWND hwnd, EditorState* st) {
 bool EditorFlushGlobal(HWND hwnd, EditorState* st) {
     int h = _wtoi(TrimW(EdGetText(hwnd, IDC_HEIGHT_EDIT)).c_str());
     if (h < MIN_HEIGHT_DIP || h > MAX_HEIGHT_DIP) {
+        st->modalBusy = true;   // block reentrant panel-menu commands while this dialog is up
         InfoDialog(hwnd, T(S_DLG_HEIGHT_TITLE), T(S_DLG_HEIGHT_BODY), TD_WARNING_ICON);
+        st->modalBusy = false;
         return false;
     }
     st->heightDip = h;
@@ -2658,13 +2675,25 @@ void EditorUpdateRow(HWND hwnd, EditorState* st, int idx) {
     InvalidateRect(lb, nullptr, TRUE);
 }
 
+// Build the "Monitor N" label without passing the format string to a printf-family
+// call. An external lang file may override S_ED_MON_FMT, and a stray %s in a
+// translation would make the CRT read the int argument as a pointer and crash —
+// so substitute the literal %d marker (append the number if a translator dropped it)
+// and treat every other character, including any %, as plain text.
+std::wstring FormatMonitorLabel(int n) {
+    std::wstring s = T(S_ED_MON_FMT);
+    size_t pos = s.find(L"%d");
+    if (pos != std::wstring::npos) s.replace(pos, 2, std::to_wstring(n));
+    else { s += L' '; s += std::to_wstring(n); }
+    return s;
+}
+
 void EditorFillMonCombo(HWND hwnd, EditorState* st) {
     HWND cb = GetDlgItem(hwnd, IDC_MON_COMBO);
     SendMessageW(cb, CB_RESETCONTENT, 0, 0);
     for (size_t i = 0; i < st->mons.size(); ++i) {
-        wchar_t buf[48];
-        _snwprintf_s(buf, _countof(buf), _TRUNCATE, T(S_ED_MON_FMT), static_cast<int>(i) + 1);
-        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(buf));
+        std::wstring lbl = FormatMonitorLabel(static_cast<int>(i) + 1);
+        SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(lbl.c_str()));
     }
     SendMessageW(cb, CB_SETCURSEL, st->curMon, 0);
     // Swapping needs at least two monitor sets to swap between.
@@ -2995,9 +3024,8 @@ void EditorListContextMenu(HWND hwnd, EditorState* st, int sx, int sy) {
         HMENU sub = CreatePopupMenu();
         for (size_t i = 0; i < st->mons.size(); ++i) {
             if (static_cast<int>(i) == st->curMon) continue;
-            wchar_t buf[48];
-            _snwprintf_s(buf, _countof(buf), _TRUNCATE, T(S_ED_MON_FMT), static_cast<int>(i) + 1);
-            AppendMenuW(sub, MF_STRING, CTX_MOVE_BASE + i, buf);
+            std::wstring lbl = FormatMonitorLabel(static_cast<int>(i) + 1);
+            AppendMenuW(sub, MF_STRING, CTX_MOVE_BASE + i, lbl.c_str());
         }
         AppendMenuW(m, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), T(S_ED_CTX_MOVE));
     } else {
@@ -3083,20 +3111,29 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
             return 0;
 
         case WM_MMP_RELOAD:
-            // The config was replaced from the panel menu (Set default / Erase) while
-            // this window is open. Re-sync our in-memory snapshot so a later OK/Apply
-            // won't clobber that action with our now-stale model. With unsaved edits,
-            // ask first — declining keeps the current model so the user can still Apply
-            // (or Cancel) it deliberately.
+            // The config was replaced from the panel menu (Reload / Set default / Erase)
+            // while this window is open. Re-sync our in-memory snapshot so a later
+            // OK/Apply won't clobber that action with our now-stale model. With unsaved
+            // edits, ask first — declining keeps the current model so the user can still
+            // Apply (or Cancel) it deliberately.
             if (st) {
-                if (st->dirty &&
-                    !ConfirmDialog(hwnd, T(S_DLG_EXTRELOAD_TITLE), T(S_DLG_EXTRELOAD_BODY),
-                                   T(S_DLG_EXTRELOAD_OK), TD_WARNING_ICON))
-                    return 0;
+                if (st->modalBusy) return 0;   // reentrant trigger while a dialog is up
+                if (st->dirty) {
+                    st->modalBusy = true;
+                    bool proceed = ConfirmDialog(hwnd, T(S_DLG_EXTRELOAD_TITLE),
+                                                 T(S_DLG_EXTRELOAD_BODY),
+                                                 T(S_DLG_EXTRELOAD_OK), TD_WARNING_ICON);
+                    st->modalBusy = false;
+                    if (!proceed) return 0;
+                }
                 st->loading = true;
                 EditorLoadModel(st);
-                st->curMon = 0;
-                st->curBtn = (st->mons.empty() || st->mons[0].empty()) ? -1 : 0;
+                // Keep the current monitor tab if it still exists (Erase can shrink the
+                // set); EditorLoadModel guarantees at least one monitor.
+                if (st->curMon >= static_cast<int>(st->mons.size()))
+                    st->curMon = static_cast<int>(st->mons.size()) - 1;
+                if (st->curMon < 0) st->curMon = 0;
+                st->curBtn = st->mons[st->curMon].empty() ? -1 : 0;
                 EditorFillMonCombo(hwnd, st);
                 EdSetText(hwnd, IDC_HEIGHT_EDIT,  std::to_wstring(st->heightDip));
                 EdSetText(hwnd, IDC_ICONDIR_EDIT, st->iconDir);
@@ -3222,9 +3259,14 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                 case IDC_MON_DEL:
                     if (st->mons.size() > 1) {
                         EditorFlushFields(hwnd, st);
-                        bool nonEmpty = !st->mons.back().empty();
-                        if (!nonEmpty || ConfirmDialog(hwnd, T(S_DLG_RMMON_TITLE),
-                                T(S_DLG_RMMON_BODY), T(S_DLG_RMMON_OK), TD_WARNING_ICON)) {
+                        bool ok = st->mons.back().empty();
+                        if (!ok) {
+                            st->modalBusy = true;
+                            ok = ConfirmDialog(hwnd, T(S_DLG_RMMON_TITLE),
+                                    T(S_DLG_RMMON_BODY), T(S_DLG_RMMON_OK), TD_WARNING_ICON);
+                            st->modalBusy = false;
+                        }
+                        if (ok) {
                             st->mons.pop_back();
                             if (st->curMon >= static_cast<int>(st->mons.size()))
                                 st->curMon = static_cast<int>(st->mons.size()) - 1;
@@ -3240,10 +3282,8 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                         HMENU m = CreatePopupMenu();
                         for (size_t i = 0; i < st->mons.size(); ++i) {
                             if (static_cast<int>(i) == st->curMon) continue;
-                            wchar_t buf[48];
-                            _snwprintf_s(buf, _countof(buf), _TRUNCATE,
-                                         T(S_ED_MON_FMT), static_cast<int>(i) + 1);
-                            AppendMenuW(m, MF_STRING, i + 1, buf);   // id = target+1 (1-based, 0 = cancel)
+                            std::wstring lbl = FormatMonitorLabel(static_cast<int>(i) + 1);
+                            AppendMenuW(m, MF_STRING, i + 1, lbl.c_str());   // id = target+1 (1-based, 0 = cancel)
                         }
                         RECT rc{};
                         GetWindowRect(GetDlgItem(hwnd, IDC_MON_SWAP), &rc);
@@ -3278,12 +3318,18 @@ LRESULT CALLBACK EditorProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
                     PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
                     st->dirty = false;
                     break;
-                case IDCANCEL:
-                    if (!st->dirty ||
-                        ConfirmDialog(hwnd, T(S_DLG_CLOSE_TITLE), T(S_DLG_CLOSE_BODY),
-                                      T(S_DLG_CLOSE_OK), TD_WARNING_ICON))
-                        DestroyWindow(hwnd);
+                case IDCANCEL: {
+                    if (st->modalBusy) return 0;   // reentrant close while a dialog is up
+                    bool doClose = !st->dirty;
+                    if (!doClose) {
+                        st->modalBusy = true;
+                        doClose = ConfirmDialog(hwnd, T(S_DLG_CLOSE_TITLE), T(S_DLG_CLOSE_BODY),
+                                                T(S_DLG_CLOSE_OK), TD_WARNING_ICON);
+                        st->modalBusy = false;
+                    }
+                    if (doClose) DestroyWindow(hwnd);
                     break;
+                }
             }
             return 0;
         }
@@ -3441,6 +3487,10 @@ void ShowContextMenu(HWND hwnd) {
     DestroyMenu(m);   // also destroys the attached langMenu submenu
     for (HBITMAP hb : keep) if (hb) DeleteObject(hb);
 
+    // A display/DPI change while the menu was open can rebuild panels, destroying
+    // this panel's hwnd. Fall back to the controller as a still-valid dialog/shell parent.
+    HWND owner = IsWindow(hwnd) ? hwnd : g_hCtrl;
+
     // Language picked: persist + reload strings + rebuild panels (and editor).
     if (static_cast<int>(cmd) >= MENU_LANG_BASE &&
         static_cast<int>(cmd) < MENU_LANG_BASE + static_cast<int>(langs.size())) {
@@ -3461,13 +3511,17 @@ void ShowContextMenu(HWND hwnd) {
             OpenConfigEditor(hwnd);
             break;
         case MENU_ABOUT:
-            AboutDialog(hwnd);
+            AboutDialog(owner);
             break;
         case MENU_RELOAD:
             PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
+            // Same re-sync as Set default / Erase: Reload exists to pick up an external
+            // registry change, so an open editor's stale snapshot must refresh too —
+            // otherwise its next OK/Apply would silently undo the reload.
+            if (g_hEditor) SendMessageW(g_hEditor, WM_MMP_RELOAD, 0, 0);
             break;
         case MENU_SETDEFAULT:
-            if (ConfirmDialog(hwnd, T(S_DLG_SETDEF_TITLE), T(S_DLG_SETDEF_BODY),
+            if (ConfirmDialog(owner, T(S_DLG_SETDEF_TITLE), T(S_DLG_SETDEF_BODY),
                     T(S_DLG_SETDEF_OK), TD_WARNING_ICON)) {
                 SetDefaultConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
@@ -3476,7 +3530,7 @@ void ShowContextMenu(HWND hwnd) {
             }
             break;
         case MENU_ERASE:
-            if (ConfirmDialog(hwnd, T(S_DLG_ERASE_TITLE), T(S_DLG_ERASE_BODY),
+            if (ConfirmDialog(owner, T(S_DLG_ERASE_TITLE), T(S_DLG_ERASE_BODY),
                     T(S_DLG_ERASE_OK), TD_WARNING_ICON)) {
                 EraseConfig();
                 PostMessageW(g_hCtrl, WM_MMP_RELOAD, 0, 0);
@@ -3490,7 +3544,7 @@ void ShowContextMenu(HWND hwnd) {
             // no-ops under our COINIT_DISABLE_OLE1DDE apartment. explorer.exe
             // with an argument always opens the folder.
             std::wstring arg = L"\"" + GetExeDir() + L"\"";
-            ShellExecuteW(hwnd, nullptr, L"explorer.exe", arg.c_str(),
+            ShellExecuteW(owner, nullptr, L"explorer.exe", arg.c_str(),
                           nullptr, SW_SHOWNORMAL);
             break;
         }
@@ -3530,11 +3584,17 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
 
         case WM_DPICHANGED:
             if (p) {
-                // The monitor's scale changed. RepositionAppBar alone would relayout
-                // the buttons but leave icons at the old pixel size (DrawIconEx then
-                // upscales them → blurry). Rebuild every panel so icons reload at each
-                // monitor's current DPI, honoring the manifest's PerMonitorV2 claim.
-                PostMessageW(g_hCtrl, WM_MMP_REBUILD, 0, 0);
+                // The monitor's scale changed. Update dpi now so any interim
+                // ABN_POSCHANGED repositions the bar at the new scale, then post a
+                // coalesced rebuild so icons reload at the new pixel size (a plain
+                // RepositionAppBar would leave them upscaled/blurry). The flag collapses
+                // the burst of WM_DPICHANGED / WM_DISPLAYCHANGE a scale change fires
+                // across N monitors into a single rebuild instead of N.
+                p->dpi = HIWORD(w);
+                if (!g_rebuildPending) {
+                    g_rebuildPending = true;
+                    PostMessageW(g_hCtrl, WM_MMP_REBUILD, 0, 0);
+                }
             }
             return 0;
 
@@ -3655,11 +3715,15 @@ LRESULT CALLBACK BtnSubclassProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l,
 LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     switch (msg) {
         case WM_DISPLAYCHANGE:
-            PostMessageW(hwnd, WM_MMP_REBUILD, 0, 0);
+            if (!g_rebuildPending) {
+                g_rebuildPending = true;
+                PostMessageW(hwnd, WM_MMP_REBUILD, 0, 0);
+            }
             return 0;
 
         case WM_MMP_REBUILD:
         case WM_MMP_RELOAD:
+            g_rebuildPending = false;   // clear first: a change during the rebuild re-arms it
             DestroyAllPanels();
             LoadGlobalCfg();
             CreateAllPanels();
