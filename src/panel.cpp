@@ -61,7 +61,7 @@ constexpr wchar_t kMutexName[]    = L"Local\\MultiMonitorPanel.SingleInstance.B1
 constexpr wchar_t kRegSubkey[]    = L"Software\\MultiMonitorPanel";
 
 // Release metadata — shown in the About dialog and the editor title bar.
-constexpr wchar_t kVersion[]      = L"1.2.2";
+constexpr wchar_t kVersion[]      = L"1.2.3";
 constexpr wchar_t kAuthor[]       = L"Evgenii Shapovalov";
 constexpr wchar_t kReleaseDate[]  = L"2026-07-19";
 constexpr wchar_t kRepoUrl[]      = L"https://github.com/e-u-shapovalov/MultiMonitorPanel";
